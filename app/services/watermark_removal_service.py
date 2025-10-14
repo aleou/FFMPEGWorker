@@ -1,10 +1,11 @@
-"""Service for AI-powered watermark detection and removal using Florence-2 and LaMA models."""
+"""Service for AI-powered watermark detection and removal using Florence-2 and configurable inpainting models."""
 
 from __future__ import annotations
 
 import os
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Optional
 from enum import Enum
@@ -15,6 +16,8 @@ import torch
 from loguru import logger
 from PIL import Image, ImageDraw
 from transformers import AutoProcessor, AutoModelForCausalLM
+from iopaint.model.lama import LaMa
+from iopaint.model.zits import ZITS
 from iopaint.model_manager import ModelManager
 from iopaint.schema import HDStrategy, LDMSampler, InpaintRequest as Config
 import tqdm
@@ -28,17 +31,149 @@ class TaskType(str, Enum):
 class WatermarkRemovalService:
     """Service for detecting and removing watermarks from videos using AI models."""
 
-    def __init__(self, device: str = "auto"):
+    SUPPORTED_INPAINT_MODELS = ("lama", "zits", "cv2")
+
+    def __init__(
+        self,
+        device: str = "auto",
+        preferred_models: Sequence[str] | str | None = None,
+    ):
         """Initialize the watermark removal service.
 
         Args:
             device: Device to run models on ('cuda', 'cpu', or 'auto')
+            preferred_models: Preferred inpainting model(s) in order of priority.
         """
         self.device = device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+        self._cuda_capability = self._detect_cuda_capability()
+        self._inpaint_candidates = self._resolve_inpaint_candidates(preferred_models)
+        self._remaining_inpaint_candidates = list(self._inpaint_candidates)
+
         self.florence_model: Optional[AutoModelForCausalLM] = None
         self.florence_processor: Optional[AutoProcessor] = None
-        self.lama_model_manager: Optional[ModelManager] = None
-        logger.info(f"Using device: {self.device}")
+        self.inpaint_model_manager: Optional[ModelManager] = None
+        self._inpaint_device: torch.device | None = None
+        self._active_inpaint_model: str | None = None
+
+        logger.info(
+            f"Using device: {self.device} (inpaint preferences: {', '.join(self._inpaint_candidates)})"
+        )
+
+    @staticmethod
+    def _coerce_device(device: str | torch.device) -> torch.device:
+        return device if isinstance(device, torch.device) else torch.device(device)
+
+    def _detect_cuda_capability(self) -> float | None:
+        if not torch.cuda.is_available():
+            return None
+        try:
+            major, minor = torch.cuda.get_device_capability()
+            return float(f"{major}.{minor}")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"Unable to read CUDA capability ({exc}); assuming no CUDA acceleration.")
+            return None
+
+    def _resolve_inpaint_candidates(self, preferred: Sequence[str] | str | None) -> list[str]:
+        raw: list[str]
+        if preferred is None:
+            raw = ["auto"]
+        elif isinstance(preferred, str):
+            raw = [part.strip() for part in preferred.split(",") if part.strip()]
+        else:
+            raw = [str(part).strip() for part in preferred if str(part).strip()]
+
+        if not raw:
+            raw = ["auto"]
+
+        resolved: list[str] = []
+        include_defaults = any(item.lower() in {"auto", "default"} for item in raw)
+        explicit = [item.lower() for item in raw if item.lower() not in {"auto", "default"}]
+
+        if explicit:
+            for item in explicit:
+                if item in self.SUPPORTED_INPAINT_MODELS:
+                    resolved.append(item)
+                else:
+                    logger.warning(f"Unsupported inpaint model '{item}' ignored.")
+
+        if include_defaults or not resolved:
+            resolved.extend([model for model in self.SUPPORTED_INPAINT_MODELS if model not in resolved])
+
+        unique_resolved: list[str] = []
+        for model in resolved:
+            if model not in unique_resolved:
+                unique_resolved.append(model)
+        resolved = unique_resolved
+
+        # If GPU capability is insufficient for LaMa and it was included only via defaults, skip it.
+        if self._cuda_capability is not None and self._cuda_capability < 7.0:
+            if "lama" in resolved and "lama" not in explicit:
+                logger.info(
+                    f"Skipping LaMA in auto selection due to CUDA capability {self._cuda_capability:.1f} "
+                    "(requires sm_70+)."
+                )
+                resolved = [model for model in resolved if model != "lama"]
+
+        return resolved
+
+    def _candidate_devices_for_model(self, model_name: str) -> list[torch.device]:
+        if model_name == "lama":
+            if self._cuda_capability is not None and self._cuda_capability >= 7.0 and self.device.startswith("cuda"):
+                return [torch.device(self.device), torch.device("cpu")]
+            return [torch.device("cpu")]
+
+        if model_name == "zits":
+            cpu_device = torch.device("cpu")
+            if torch.cuda.is_available() and self.device.startswith("cuda"):
+                if self._cuda_capability is not None and self._cuda_capability >= 7.0:
+                    return [torch.device(self.device), cpu_device]
+                return [cpu_device, torch.device(self.device)]
+            return [cpu_device]
+
+        return [torch.device("cpu")]
+
+    def _prepare_model_resources(self, model_name: str) -> None:
+        if model_name == "lama" and not LaMa.is_downloaded():
+            logger.info("Downloading LaMA model weights...")
+            LaMa.download()
+        elif model_name == "zits" and not ZITS.is_downloaded():
+            logger.info("Downloading ZITS model weights...")
+            ZITS.download()
+
+    def _initialize_inpaint_model(self) -> None:
+        errors: list[str] = []
+        for model_name in list(self._remaining_inpaint_candidates):
+            devices = self._candidate_devices_for_model(model_name)
+            for device in devices:
+                try:
+                    self._prepare_model_resources(model_name)
+                    manager = ModelManager(name=model_name, device=device)
+                    self.inpaint_model_manager = manager
+                    self._inpaint_device = device
+                    self._active_inpaint_model = model_name
+                    logger.info(f"Inpaint model '{model_name}' loaded on {device.type}")
+                    return
+                except NotImplementedError as exc:
+                    message = f"{model_name}@{device.type}: {exc}"
+                    logger.warning(f"Inpaint model unavailable ({message})")
+                    errors.append(message)
+                except RuntimeError as exc:
+                    message = f"{model_name}@{device.type}: {exc}"
+                    logger.error(f"Failed to initialize inpaint model ({message})")
+                    errors.append(message)
+            self._remaining_inpaint_candidates = [
+                candidate for candidate in self._remaining_inpaint_candidates if candidate != model_name
+            ]
+
+        raise RuntimeError(
+            "Unable to load any inpainting model. Attempted: "
+            + ", ".join(self._inpaint_candidates)
+            + (f". Errors: {errors}" if errors else "")
+        )
+
+    def _ensure_inpaint_model(self) -> None:
+        if self.inpaint_model_manager is None:
+            self._initialize_inpaint_model()
 
     def _load_models(self):
         """Load the AI models if not already loaded."""
@@ -52,10 +187,7 @@ class WatermarkRemovalService:
             )
             logger.info("Florence-2 model loaded")
 
-        if self.lama_model_manager is None:
-            logger.info("Loading LaMA model...")
-            self.lama_model_manager = ModelManager(name="lama", device=self.device)
-            logger.info("LaMA model loaded")
+        self._ensure_inpaint_model()
 
     def _identify_watermark(self, image: Image.Image, text_input: str) -> dict:
         """Detect watermarks in an image using Florence-2.
@@ -100,7 +232,7 @@ class WatermarkRemovalService:
         Returns:
             Binary mask image
         """
-        text_input = "watermark"
+        text_input = "watermark logo sora"
         parsed_answer = self._identify_watermark(image, text_input)
 
         mask = Image.new("L", image.size, 0)
@@ -122,8 +254,8 @@ class WatermarkRemovalService:
 
         return mask
 
-    def _process_image_with_lama(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Remove watermarks from an image using LaMA inpainting.
+    def _process_image_with_inpainter(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Remove watermarks from an image using the configured inpainting model.
 
         Args:
             image: Input image as numpy array
@@ -141,7 +273,26 @@ class WatermarkRemovalService:
             hd_strategy_resize_limit=1600,
         )
 
-        result = self.lama_model_manager(image, mask, config)
+        attempts: set[str] = set()
+        while True:
+            self._ensure_inpaint_model()
+            assert self.inpaint_model_manager is not None
+            model_name = self._active_inpaint_model or "unknown"
+            try:
+                result = self.inpaint_model_manager(image, mask, config)
+                break
+            except RuntimeError as exc:
+                device_label = self._inpaint_device.type if self._inpaint_device else "unknown"
+                logger.error(
+                    f"Inpaint model '{model_name}' on {device_label} failed: {exc}"
+                )
+                attempts.add(model_name)
+                self.inpaint_model_manager = None
+                self._active_inpaint_model = None
+                self._inpaint_device = None
+                if len(attempts) >= len(self._inpaint_candidates):
+                    raise
+                continue
 
         if result.dtype in [np.float64, np.float32]:
             result = np.clip(result, 0, 255).astype(np.uint8)
@@ -255,11 +406,11 @@ class WatermarkRemovalService:
                     background.paste(result_image, mask=result_image.split()[3])
                     result_image = background
                 else:
-                    lama_result = self._process_image_with_lama(
+                    inpaint_result = self._process_image_with_inpainter(
                         np.array(pil_image), np.array(mask_image)
                     )
                     result_image = Image.fromarray(
-                        cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB)
+                        cv2.cvtColor(inpaint_result, cv2.COLOR_BGR2RGB)
                     )
 
                 # Convert back to OpenCV format and write
@@ -292,14 +443,16 @@ class WatermarkRemovalService:
                 return output_file
 
             # Use FFmpeg to combine video and audio
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
                 "-i", str(temp_video_path),  # Processed video without audio
                 "-i", str(input_path),       # Original video with audio
                 "-c:v", "copy",              # Copy video without re-encoding
-                "-c:a", "aac",               # Encode audio to AAC
+                "-c:a", "copy",              # Keep original audio codec when possible
                 "-map", "0:v:0",             # Use video from first input
-                "-map", "1:a:0",             # Use audio from second input
+                "-map", "1:a?",              # Use audio from second input if present
                 "-shortest",                 # Stop when shortest stream ends
                 str(output_file)
             ]
@@ -369,10 +522,10 @@ class WatermarkRemovalService:
         if transparent:
             result_image = self._make_region_transparent(image, mask_image)
         else:
-            lama_result = self._process_image_with_lama(
+            inpaint_result = self._process_image_with_inpainter(
                 np.array(image), np.array(mask_image)
             )
-            result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+            result_image = Image.fromarray(cv2.cvtColor(inpaint_result, cv2.COLOR_BGR2RGB))
 
         # Determine output format
         if force_format:

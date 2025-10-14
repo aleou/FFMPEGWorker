@@ -11,7 +11,7 @@ async def test_watermark_removal():
     settings = get_settings()
 
     # Initialize service
-    service = WatermarkRemovalService(device=settings.AI_DEVICE)
+    service = WatermarkRemovalService(device=settings.AI_DEVICE, preferred_models=settings.WATERMARK_INPAINT_MODELS)
 
     # Test with a sample image (you would need to provide an actual image)
     input_path = Path("test_input.jpg")  # Replace with actual test file

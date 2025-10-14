@@ -1,11 +1,17 @@
 """Routes for managing processing jobs."""
 
-from uuid import UUID
+import json
+import logging
+from pathlib import Path
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from pydantic import ValidationError
 
-from app.dependencies import JobServiceDep, WatermarkRemovalServiceDep
-from app.schemas.job import JobCreate, JobRead, JobUpdate
+from app.dependencies import JobServiceDep, SettingsDep, WatermarkRemovalServiceDep
+from app.schemas.job import JobCreate, JobRead, JobUpdate, WatermarkRemovalConfig
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -21,6 +27,99 @@ async def enqueue_job(payload: JobCreate, job_service: JobServiceDep) -> JobRead
     """Accept a job payload and register it for downstream processing."""
 
     job = job_service.create_job(payload)
+    return job
+
+
+@router.post(
+    "/upload",
+    response_model=JobRead,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Submit a job with an uploaded file",
+    response_description="Representation of the created job.",
+)
+async def enqueue_job_with_upload(
+    job_service: JobServiceDep,
+    settings: SettingsDep,
+    file: UploadFile = File(..., description="Source media file to process."),
+    job_type: str = Form(default="watermark_removal", description="Type of job to queue."),
+    priority: int = Form(default=5, ge=1, le=10, description="Priority applied to the enqueued job."),
+    target_filename: str | None = Form(
+        default=None,
+        description="Optional override for the output filename (defaults to '<input>_processed').",
+    ),
+    metadata_json: str | None = Form(
+        default=None,
+        description="Optional JSON-encoded metadata to attach to the job.",
+    ),
+    watermark_config_json: str | None = Form(
+        default=None,
+        description="Optional JSON-encoded watermark removal configuration.",
+    ),
+) -> JobRead:
+    """Accept a multipart upload, persist it locally, and enqueue the corresponding job."""
+
+    upload_token = uuid4().hex
+    uploads_dir = settings.WORK_DIR / "uploads" / upload_token
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    original_name = Path(file.filename or f"upload-{upload_token}.mp4")
+    input_path = uploads_dir / original_name.name
+
+    # Stream upload to disk to avoid loading large files into memory.
+    with input_path.open("wb") as buffer:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            buffer.write(chunk)
+    await file.close()
+
+    logger.info("Stored upload %s at %s", file.filename, input_path)
+    # Determine output filename and path.
+    if target_filename:
+        output_name = Path(target_filename)
+        if not output_name.suffix:
+            output_name = output_name.with_suffix(original_name.suffix or ".mp4")
+    else:
+        suffix = original_name.suffix or ".mp4"
+        output_name = Path(f"{original_name.stem}_processed{suffix}")
+
+    outputs_dir = settings.WORK_DIR / "outputs" / upload_token
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    output_path = outputs_dir / output_name.name
+
+    # Parse optional metadata payloads.
+    metadata = None
+    if metadata_json:
+        try:
+            metadata = json.loads(metadata_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid metadata JSON: {exc}",
+            ) from exc
+
+    watermark_config = None
+    if watermark_config_json:
+        try:
+            watermark_config = WatermarkRemovalConfig.model_validate_json(watermark_config_json)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid watermark configuration: {exc.errors()}",
+            ) from exc
+
+    job_payload = JobCreate(
+        source_uri=input_path,
+        target_uri=output_path,
+        priority=priority,
+        metadata=metadata,
+        job_type=job_type,
+        watermark_removal_config=watermark_config,
+    )
+
+    job = job_service.create_job(job_payload)
+    logger.info("Enqueued job %s of type %s", job.id, job.job_type)
     return job
 
 

@@ -1,0 +1,211 @@
+{
+  "a74c6a4f-8ffe-433a-96f3-1ea2f0493274": {
+    "source_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\uploads\\8f848be8f32b4a54a0cca7cefd795d62\\20251014_1244_01k7h4k31ge729m948s2j022w2.mp4",
+    "target_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\outputs\\8f848be8f32b4a54a0cca7cefd795d62\\20251014_1244_01k7h4k31ge729m948s2j022w2_processed.mp4",
+    "metadata": {
+      "note": "demo multipart"
+    },
+    "job_type": "watermark_removal",
+    "watermark_removal_config": {
+      "transparent": false,
+      "max_bbox_percent": 15.0,
+      "force_format": null,
+      "overwrite": false
+    },
+    "id": "a74c6a4f-8ffe-433a-96f3-1ea2f0493274",
+    "status": "failed",
+    "created_at": "2025-10-14T19:12:53.083066",
+    "progress": 0.0,
+    "error": "Unsupported model: lama. Available models: ['cv2']"
+  },
+  "260bf33e-8002-4d29-beb6-043f01264248": {
+    "source_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\uploads\\23b261e76b4144848e37416df1b9f478\\20251014_1244_01k7h4k31ge729m948s2j022w2.mp4",
+    "target_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\outputs\\23b261e76b4144848e37416df1b9f478\\20251014_1244_01k7h4k31ge729m948s2j022w2_processed.mp4",
+    "metadata": {
+      "note": "demo multipart"
+    },
+    "job_type": "watermark_removal",
+    "watermark_removal_config": {
+      "transparent": false,
+      "max_bbox_percent": 15.0,
+      "force_format": null,
+      "overwrite": false
+    },
+    "id": "260bf33e-8002-4d29-beb6-043f01264248",
+    "status": "failed",
+    "created_at": "2025-10-14T19:27:51.489289",
+    "progress": 0.0,
+    "error": "CUDA error: no kernel image is available for execution on the device\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "fcec23fe-3563-4a48-92a2-608f95bda144": {
+    "source_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\uploads\\aa9bdb007fcf423da0b882eea2081cd3\\20251014_1244_01k7h4k31ge729m948s2j022w2.mp4",
+    "target_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\outputs\\aa9bdb007fcf423da0b882eea2081cd3\\20251014_1244_01k7h4k31ge729m948s2j022w2_processed.mp4",
+    "metadata": {
+      "note": "demo multipart"
+    },
+    "job_type": "watermark_removal",
+    "watermark_removal_config": {
+      "transparent": false,
+      "max_bbox_percent": 15.0,
+      "force_format": null,
+      "overwrite": false
+    },
+    "id": "fcec23fe-3563-4a48-92a2-608f95bda144",
+    "status": "failed",
+    "created_at": "2025-10-14T19:33:18.395066",
+    "progress": 0.0,
+    "error": "CUDA error: no kernel image is available for execution on the device\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "41eb4cf8-e201-4d8c-b55f-d3fed4eafe25": {
+    "source_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\uploads\\f251ed6ba5fa4f579f86d2b7293c4d3f\\20251014_1244_01k7h4k31ge729m948s2j022w2.mp4",
+    "target_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\outputs\\f251ed6ba5fa4f579f86d2b7293c4d3f\\20251014_1244_01k7h4k31ge729m948s2j022w2_processed.mp4",
+    "metadata": {
+      "note": "demo multipart"
+    },
+    "job_type": "watermark_removal",
+    "watermark_removal_config": {
+      "transparent": false,
+      "max_bbox_percent": 15.0,
+      "force_format": null,
+      "overwrite": false
+    },
+    "id": "41eb4cf8-e201-4d8c-b55f-d3fed4eafe25",
+    "status": "failed",
+    "created_at": "2025-10-14T19:34:55.321570",
+    "progress": 0.0,
+    "error": "CUDA error: no kernel image is available for execution on the device\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "7facf213-cb3e-41c9-ae75-9c16309b489d": {
+    "source_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\uploads\\5c935b8c3a064d84b4a97d0b2fb1d069\\20251014_1244_01k7h4k31ge729m948s2j022w2.mp4",
+    "target_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\outputs\\5c935b8c3a064d84b4a97d0b2fb1d069\\20251014_1244_01k7h4k31ge729m948s2j022w2_processed.mp4",
+    "metadata": {
+      "note": "demo multipart"
+    },
+    "job_type": "watermark_removal",
+    "watermark_removal_config": {
+      "transparent": false,
+      "max_bbox_percent": 15.0,
+      "force_format": null,
+      "overwrite": false
+    },
+    "id": "7facf213-cb3e-41c9-ae75-9c16309b489d",
+    "status": "failed",
+    "created_at": "2025-10-14T19:40:40.116381",
+    "progress": 0.0,
+    "error": "CUDA error: no kernel image is available for execution on the device\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "f7202502-85ab-4409-884a-e9a393046ebb": {
+    "source_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\uploads\\1f8401c3e3da40fe82c7979c3ff7b9cd\\20251014_1244_01k7h4k31ge729m948s2j022w2.mp4",
+    "target_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\outputs\\1f8401c3e3da40fe82c7979c3ff7b9cd\\20251014_1244_01k7h4k31ge729m948s2j022w2_processed.mp4",
+    "metadata": {
+      "note": "demo multipart"
+    },
+    "job_type": "watermark_removal",
+    "watermark_removal_config": {
+      "transparent": false,
+      "max_bbox_percent": 15.0,
+      "force_format": null,
+      "overwrite": false
+    },
+    "id": "f7202502-85ab-4409-884a-e9a393046ebb",
+    "status": "failed",
+    "created_at": "2025-10-14T20:01:28.447038",
+    "progress": 0.0,
+    "error": "CUDA error: no kernel image is available for execution on the device\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "53d8ae3c-f60b-4f23-a68f-3804b5726180": {
+    "source_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\uploads\\50ff8d71e0254a1da61175c68f7e63eb\\20251014_1244_01k7h4k31ge729m948s2j022w2.mp4",
+    "target_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\outputs\\50ff8d71e0254a1da61175c68f7e63eb\\20251014_1244_01k7h4k31ge729m948s2j022w2_processed.mp4",
+    "metadata": {
+      "note": "demo multipart"
+    },
+    "job_type": "watermark_removal",
+    "watermark_removal_config": {
+      "transparent": false,
+      "max_bbox_percent": 15.0,
+      "force_format": null,
+      "overwrite": false
+    },
+    "id": "53d8ae3c-f60b-4f23-a68f-3804b5726180",
+    "status": "failed",
+    "created_at": "2025-10-14T20:06:40.309016",
+    "progress": 0.0,
+    "error": "CUDA error: no kernel image is available for execution on the device\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  },
+  "2fa07a36-4b03-48f5-8428-4724d318e1d6": {
+    "source_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\uploads\\bf70b444c4dd4ee6927970b518a82867\\20251014_1244_01k7h4k31ge729m948s2j022w2.mp4",
+    "target_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\outputs\\bf70b444c4dd4ee6927970b518a82867\\20251014_1244_01k7h4k31ge729m948s2j022w2_processed.mp4",
+    "metadata": {
+      "note": "demo multipart"
+    },
+    "job_type": "watermark_removal",
+    "watermark_removal_config": {
+      "transparent": false,
+      "max_bbox_percent": 15.0,
+      "force_format": null,
+      "overwrite": false
+    },
+    "id": "2fa07a36-4b03-48f5-8428-4724d318e1d6",
+    "status": "failed",
+    "created_at": "2025-10-14T20:32:02.074126",
+    "progress": 0.0,
+    "error": "'pydantic_core._pydantic_core.ValidationInfo' object has no attribute 'sd_seed'"
+  },
+  "1ed0e89c-3d39-4f66-9f1d-4cb7d1c8fdad": {
+    "source_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\uploads\\0cf5dd0d1c144748934091fe19785f92\\20251014_1244_01k7h4k31ge729m948s2j022w2.mp4",
+    "target_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\outputs\\0cf5dd0d1c144748934091fe19785f92\\20251014_1244_01k7h4k31ge729m948s2j022w2_processed.mp4",
+    "metadata": {
+      "note": "demo multipart"
+    },
+    "job_type": "watermark_removal",
+    "watermark_removal_config": {
+      "transparent": false,
+      "max_bbox_percent": 15.0,
+      "force_format": null,
+      "overwrite": false
+    },
+    "id": "1ed0e89c-3d39-4f66-9f1d-4cb7d1c8fdad",
+    "status": "completed",
+    "created_at": "2025-10-14T20:37:35.330935",
+    "progress": 1.0,
+    "error": null
+  },
+  "7ce7612b-1de0-4ef5-852f-cd368e1e77f3": {
+    "source_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\uploads\\86b7802348674f92a2524096d7457cbe\\20251014_1244_01k7h4k31ge729m948s2j022w2.mp4",
+    "target_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\outputs\\86b7802348674f92a2524096d7457cbe\\20251014_1244_01k7h4k31ge729m948s2j022w2_processed.mp4",
+    "metadata": {
+      "note": "demo multipart"
+    },
+    "job_type": "watermark_removal",
+    "watermark_removal_config": {
+      "transparent": false,
+      "max_bbox_percent": 15.0,
+      "force_format": null,
+      "overwrite": false
+    },
+    "id": "7ce7612b-1de0-4ef5-852f-cd368e1e77f3",
+    "status": "completed",
+    "created_at": "2025-10-14T20:52:08.350073",
+    "progress": 1.0,
+    "error": null
+  },
+  "40880723-6d1b-410e-811c-52bf4fccfede": {
+    "source_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\uploads\\fb07bc3d78364134855104278aba92b3\\20251014_1244_01k7h4k31ge729m948s2j022w2.mp4",
+    "target_uri": "c:\\Users\\alexi\\Desktop\\FFMPEGWorker\\outputs\\fb07bc3d78364134855104278aba92b3\\20251014_1244_01k7h4k31ge729m948s2j022w2_processed.mp4",
+    "metadata": {
+      "note": "demo multipart"
+    },
+    "job_type": "watermark_removal",
+    "watermark_removal_config": {
+      "transparent": false,
+      "max_bbox_percent": 15.0,
+      "force_format": null,
+      "overwrite": false
+    },
+    "id": "40880723-6d1b-410e-811c-52bf4fccfede",
+    "status": "completed",
+    "created_at": "2025-10-14T21:00:18.581929",
+    "progress": 1.0,
+    "error": null
+  }
+}

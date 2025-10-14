@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     AI_DEVICE: str = "auto"  # 'auto', 'cuda', 'cpu'
     FLORENCE_MODEL_CACHE_DIR: Path | None = None
     LAMA_MODEL_CACHE_DIR: Path | None = None
+    WATERMARK_INPAINT_MODELS: str = "auto"  # e.g. "zits", "lama", "lama,zits", or "auto"
 
     # Watermark Removal Defaults
     DEFAULT_MAX_BBOX_PERCENT: float = 10.0

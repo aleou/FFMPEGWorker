@@ -1,8 +1,10 @@
 """Video processing worker leveraging FFmpeg and AI tooling."""
 
 import logging
+import os
 from pathlib import Path
 from typing import Awaitable, Callable
+from urllib.parse import urlparse, unquote
 
 from app.schemas.job import JobRead, JobStatus, JobUpdate
 from app.services.job_service import JobService
@@ -41,6 +43,7 @@ class VideoProcessingWorker:
                 JobUpdate(status=JobStatus.completed, progress=1.0),
             )
             logger.info("Completed job %s.", job.id)
+            
 
         except Exception as e:
             logger.error("Failed to process job %s: %s", job.id, str(e))
@@ -72,10 +75,8 @@ class VideoProcessingWorker:
         if not job.watermark_removal_config:
             raise ValueError("Watermark removal configuration missing")
 
-        # Convert URLs to local paths (assuming files are already downloaded)
-        # In a real implementation, you'd download from source_uri first
-        input_path = Path(job.source_uri.path)
-        output_path = Path(job.target_uri.path)
+        input_path = self._resolve_path(job.source_uri)
+        output_path = self._resolve_path(job.target_uri)
 
         # Ensure output directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -102,3 +103,20 @@ class VideoProcessingWorker:
             )
 
         return _callback
+
+    @staticmethod
+    def _resolve_path(value: str | Path) -> Path:
+        """Normalize job URIs into local filesystem paths."""
+
+        if isinstance(value, Path):
+            return value
+
+        parsed = urlparse(str(value))
+        if parsed.scheme and parsed.path:
+            path_str = unquote(parsed.path)
+            if os.name == "nt" and path_str.startswith("/") and len(path_str) > 1:
+                # Trim the leading slash so Windows drive letters are preserved.
+                path_str = path_str.lstrip("/")
+            return Path(path_str)
+
+        return Path(str(value))

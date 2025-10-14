@@ -2,7 +2,10 @@
 
 import logging
 import logging.config
+import sys
 from typing import Optional
+
+from loguru import logger as loguru_logger
 
 from app.core.config import settings
 
@@ -58,3 +61,6 @@ def configure_logging(level: Optional[str] = None, json_logs: Optional[bool] = N
     logging_config = get_logging_config(level=level, json_logs=json_logs)
     logging.config.dictConfig(logging_config)
 
+    # Align loguru output (used by dependencies such as iopaint) with stdlib logging level.
+    loguru_logger.remove()
+    loguru_logger.add(sys.stdout, level=(level or settings.LOG_LEVEL).upper())

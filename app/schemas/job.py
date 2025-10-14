@@ -7,7 +7,8 @@ from enum import Enum
 from typing import Any, Dict, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field, HttpUrl, model_validator
+from pathlib import Path
+from pydantic import AnyUrl, BaseModel, Field, model_validator
 
 
 class WatermarkRemovalConfig(BaseModel):
@@ -31,8 +32,8 @@ class JobStatus(str, Enum):
 class JobBase(BaseModel):
     """Common data shared across job schemas."""
 
-    source_uri: HttpUrl = Field(..., description="Location of the source video to ingest.")
-    target_uri: HttpUrl = Field(..., description="Destination where the processed video will be saved.")
+    source_uri: AnyUrl | Path = Field(..., description="Location of the source video to ingest (URL or local path).")
+    target_uri: AnyUrl | Path = Field(..., description="Destination where the processed video will be saved (URL or local path).")
     metadata: Dict[str, Any] | None = Field(default=None, description="Optional job-specific metadata payload.")
     job_type: str = Field(default="video_processing", description="Type of job (video_processing, watermark_removal, etc.)")
     watermark_removal_config: WatermarkRemovalConfig | None = Field(default=None, description="Configuration for watermark removal jobs.")
@@ -62,8 +63,8 @@ class JobUpdate(BaseModel):
     error: Optional[str] = None
 
     @model_validator(mode="after")
-    def validate_payload(cls, data: "JobUpdate") -> "JobUpdate":
-        if data.status is None and data.progress is None and data.error is None:
+    def validate_payload(self) -> "JobUpdate":
+        if self.status is None and self.progress is None and self.error is None:
             raise ValueError("At least one field must be provided when updating a job.")
-        return data
+        return self
 

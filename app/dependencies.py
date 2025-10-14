@@ -1,11 +1,12 @@
 """Shared dependency injections for FastAPI routes."""
 
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import Iterator
 from typing import Annotated
 
 from fastapi import Depends
 
 from app.core.config import Settings, get_settings
+from app.services.job_registry import get_job_service_instance
 from app.services.job_service import JobService
 from app.services.watermark_removal_service import WatermarkRemovalService
 
@@ -20,9 +21,9 @@ SettingsDep = Annotated[Settings, Depends(get_app_settings)]
 
 
 def get_job_service(settings: SettingsDep) -> Iterator[JobService]:
-    """Provide a job service instance for request handlers."""
+    """Provide a shared job service instance for request handlers."""
 
-    service = JobService(settings=settings)
+    service = get_job_service_instance(settings=settings)
     yield service
 
 
@@ -32,9 +33,11 @@ JobServiceDep = Annotated[JobService, Depends(get_job_service)]
 def get_watermark_removal_service(settings: SettingsDep) -> Iterator[WatermarkRemovalService]:
     """Provide a watermark removal service instance for request handlers."""
 
-    service = WatermarkRemovalService(device=settings.AI_DEVICE)
+    service = WatermarkRemovalService(
+        device=settings.AI_DEVICE,
+        preferred_models=settings.WATERMARK_INPAINT_MODELS,
+    )
     yield service
 
 
 WatermarkRemovalServiceDep = Annotated[WatermarkRemovalService, Depends(get_watermark_removal_service)]
-
