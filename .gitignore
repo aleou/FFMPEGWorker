@@ -1,0 +1,28 @@
+# Python environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tooling
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# IDE configs
+.idea/
+.vscode/
+
+# Local env files
+.env
+.env.*
+
+# Build artifacts
+dist/
+build/
