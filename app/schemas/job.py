@@ -10,6 +10,15 @@ from uuid import UUID
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 
+class WatermarkRemovalConfig(BaseModel):
+    """Configuration for watermark removal jobs."""
+
+    transparent: bool = Field(default=False, description="Make watermark areas transparent instead of inpainting.")
+    max_bbox_percent: float = Field(default=10.0, ge=1.0, le=100.0, description="Maximum percentage of image area a bounding box can cover.")
+    force_format: str | None = Field(default=None, description="Force output format (PNG, WEBP, JPG, MP4, AVI).")
+    overwrite: bool = Field(default=False, description="Overwrite existing output files.")
+
+
 class JobStatus(str, Enum):
     """Lifecycle state of a processing job."""
 
@@ -25,6 +34,8 @@ class JobBase(BaseModel):
     source_uri: HttpUrl = Field(..., description="Location of the source video to ingest.")
     target_uri: HttpUrl = Field(..., description="Destination where the processed video will be saved.")
     metadata: Dict[str, Any] | None = Field(default=None, description="Optional job-specific metadata payload.")
+    job_type: str = Field(default="video_processing", description="Type of job (video_processing, watermark_removal, etc.)")
+    watermark_removal_config: WatermarkRemovalConfig | None = Field(default=None, description="Configuration for watermark removal jobs.")
 
 
 class JobCreate(JobBase):

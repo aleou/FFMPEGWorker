@@ -8,6 +8,7 @@ import logging
 from app.core.config import settings
 from app.core.logging import configure_logging
 from app.services.job_service import JobService
+from app.services.watermark_removal_service import WatermarkRemovalService
 from app.workers.video_worker import VideoProcessingWorker
 
 logger = logging.getLogger(__name__)
@@ -18,7 +19,8 @@ async def main() -> None:
     logger.info("Launching worker in %s environment.", settings.ENVIRONMENT)
 
     job_service = JobService(settings=settings)
-    worker = VideoProcessingWorker(job_service=job_service)
+    watermark_service = WatermarkRemovalService(device=settings.AI_DEVICE)
+    worker = VideoProcessingWorker(job_service=job_service, watermark_service=watermark_service)
 
     while True:
         has_work = False

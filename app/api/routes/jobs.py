@@ -4,7 +4,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
 
-from app.dependencies import JobServiceDep
+from app.dependencies import JobServiceDep, WatermarkRemovalServiceDep
 from app.schemas.job import JobCreate, JobRead, JobUpdate
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -63,5 +63,36 @@ async def update_job(job_id: UUID, payload: JobUpdate, job_service: JobServiceDe
     job = job_service.update_job(job_id, payload)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+    return job
+
+
+@router.post(
+    "/watermark-removal",
+    response_model=JobRead,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Submit a watermark removal job",
+    response_description="Representation of the created watermark removal job.",
+)
+async def enqueue_watermark_removal_job(
+    payload: JobCreate,
+    job_service: JobServiceDep,
+    watermark_service: WatermarkRemovalServiceDep
+) -> JobRead:
+    """Accept a watermark removal job payload and register it for processing."""
+
+    # Validate that this is a watermark removal job
+    if payload.job_type != "watermark_removal":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Job type must be 'watermark_removal' for this endpoint."
+        )
+
+    if not payload.watermark_removal_config:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Watermark removal configuration is required."
+        )
+
+    job = job_service.create_job(payload)
     return job
 

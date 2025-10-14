@@ -39,6 +39,16 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite+aiosqlite:///./ffmpeg-worker.db"
     DEFAULT_TIMEOUT_SECONDS: int = 30
 
+    # AI Model Configuration
+    AI_DEVICE: str = "auto"  # 'auto', 'cuda', 'cpu'
+    FLORENCE_MODEL_CACHE_DIR: Path | None = None
+    LAMA_MODEL_CACHE_DIR: Path | None = None
+
+    # Watermark Removal Defaults
+    DEFAULT_MAX_BBOX_PERCENT: float = 10.0
+    DEFAULT_TRANSPARENT_MODE: bool = False
+    DEFAULT_FORCE_FORMAT: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:

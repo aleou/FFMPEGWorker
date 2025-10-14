@@ -9,6 +9,51 @@ FastAPI project designed as the control plane for a video processing worker capa
 - Structured logging with optional JSON formatting
 - Dockerized and local development workflows
 - Seeded testing scaffold with `pytest`
+- **AI-powered watermark removal** using Florence-2 detection and LaMA inpainting
+
+## Watermark Removal
+
+This project includes AI-powered watermark detection and removal capabilities, similar to tools like "Sweeta" for SORA 2 videos.
+
+### Features
+- **Florence-2 Model**: Advanced vision-language model for accurate watermark detection
+- **LaMA Inpainting**: State-of-the-art inpainting model for seamless watermark removal
+- **Video Support**: Process both images and videos with frame-by-frame analysis
+- **Flexible Configuration**: Adjustable detection sensitivity, output formats, and processing options
+- **GPU Acceleration**: Automatic CUDA detection for hardware acceleration
+
+### API Usage
+
+#### Submit Watermark Removal Job
+```bash
+POST /api/v1/jobs/watermark-removal
+Content-Type: application/json
+
+{
+  "source_uri": "file:///path/to/input/video.mp4",
+  "target_uri": "file:///path/to/output/video_no_watermark.mp4",
+  "job_type": "watermark_removal",
+  "watermark_removal_config": {
+    "transparent": false,
+    "max_bbox_percent": 10.0,
+    "force_format": "MP4",
+    "overwrite": false
+  }
+}
+```
+
+#### Configuration Options
+- `transparent`: Make watermark areas transparent instead of inpainting (PNG only)
+- `max_bbox_percent`: Maximum percentage of image area a bounding box can cover (1-100%)
+- `force_format`: Force output format (PNG, WEBP, JPG, MP4, AVI)
+- `overwrite`: Overwrite existing output files
+
+### Running the Worker
+```bash
+python scripts/run_worker.py
+```
+
+The worker will automatically process watermark removal jobs alongside standard video processing jobs.
 
 ## Getting Started
 

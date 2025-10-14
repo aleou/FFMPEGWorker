@@ -1,10 +1,12 @@
 """Video processing worker leveraging FFmpeg and AI tooling."""
 
 import logging
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from app.schemas.job import JobRead, JobStatus, JobUpdate
 from app.services.job_service import JobService
+from app.services.watermark_removal_service import WatermarkRemovalService
 from app.utils.ffmpeg import build_ffmpeg_command, run_ffmpeg_command
 
 logger = logging.getLogger(__name__)
@@ -13,18 +15,42 @@ logger = logging.getLogger(__name__)
 class VideoProcessingWorker:
     """High-level orchestrator for video processing jobs."""
 
-    def __init__(self, job_service: JobService) -> None:
+    def __init__(self, job_service: JobService, watermark_service: WatermarkRemovalService | None = None) -> None:
         self._job_service = job_service
+        self._watermark_service = watermark_service
 
     async def process_job(self, job: JobRead) -> None:
         """Execute the job lifecycle."""
 
-        logger.info("Processing job %s.", job.id)
+        logger.info("Processing job %s of type %s.", job.id, job.job_type)
+
         self._job_service.update_job(
             job.id,
             JobUpdate(status=JobStatus.processing, progress=0.0),
         )
 
+        try:
+            if job.job_type == "watermark_removal":
+                await self._process_watermark_removal_job(job)
+            else:
+                # Default video processing
+                await self._process_video_job(job)
+
+            self._job_service.update_job(
+                job.id,
+                JobUpdate(status=JobStatus.completed, progress=1.0),
+            )
+            logger.info("Completed job %s.", job.id)
+
+        except Exception as e:
+            logger.error("Failed to process job %s: %s", job.id, str(e))
+            self._job_service.update_job(
+                job.id,
+                JobUpdate(status=JobStatus.failed, error=str(e)),
+            )
+
+    async def _process_video_job(self, job: JobRead) -> None:
+        """Process a standard video processing job."""
         command = build_ffmpeg_command(job)
         duration_hint = None
         if job.metadata:
@@ -38,11 +64,35 @@ class VideoProcessingWorker:
             duration_hint=duration_hint,
         )
 
-        self._job_service.update_job(
-            job.id,
-            JobUpdate(status=JobStatus.completed, progress=1.0),
+    async def _process_watermark_removal_job(self, job: JobRead) -> None:
+        """Process a watermark removal job."""
+        if not self._watermark_service:
+            raise ValueError("Watermark removal service not available")
+
+        if not job.watermark_removal_config:
+            raise ValueError("Watermark removal configuration missing")
+
+        # Convert URLs to local paths (assuming files are already downloaded)
+        # In a real implementation, you'd download from source_uri first
+        input_path = Path(job.source_uri.path)
+        output_path = Path(job.target_uri.path)
+
+        # Ensure output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        config = job.watermark_removal_config
+
+        # Process the file
+        result_path = self._watermark_service.process_file(
+            input_path=input_path,
+            output_path=output_path,
+            transparent=config.transparent,
+            max_bbox_percent=config.max_bbox_percent,
+            force_format=config.force_format,
+            overwrite=config.overwrite
         )
-        logger.info("Completed job %s.", job.id)
+
+        logger.info("Watermark removal completed: %s -> %s", input_path, result_path)
 
     def _on_progress(self, job: JobRead) -> Callable[[float], Awaitable[None]]:
         async def _callback(value: float) -> None:

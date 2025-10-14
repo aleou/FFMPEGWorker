@@ -7,6 +7,7 @@ from fastapi import Depends
 
 from app.core.config import Settings, get_settings
 from app.services.job_service import JobService
+from app.services.watermark_removal_service import WatermarkRemovalService
 
 
 def get_app_settings() -> Settings:
@@ -26,4 +27,14 @@ def get_job_service(settings: SettingsDep) -> Iterator[JobService]:
 
 
 JobServiceDep = Annotated[JobService, Depends(get_job_service)]
+
+
+def get_watermark_removal_service(settings: SettingsDep) -> Iterator[WatermarkRemovalService]:
+    """Provide a watermark removal service instance for request handlers."""
+
+    service = WatermarkRemovalService(device=settings.AI_DEVICE)
+    yield service
+
+
+WatermarkRemovalServiceDep = Annotated[WatermarkRemovalService, Depends(get_watermark_removal_service)]
 
