@@ -1,5 +1,6 @@
 accelerate==1.10.1
 aiofiles==23.2.1
+aiohttp==3.10.11
 altair==5.5.0
 annotated-types==0.7.0
 antlr4-python3-runtime==4.9.3
