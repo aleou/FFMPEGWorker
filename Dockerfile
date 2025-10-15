@@ -92,6 +92,6 @@ ENV HF_HOME=/opt/hf-cache \
 
 WORKDIR /workspace
 
-RUN pip install --no-cache-dir --no-deps runpod==1.6.1
+RUN pip install --no-cache-dir runpod==1.6.1
 
 CMD ["python", "-m", "app.serverless.runpod_handler"]
