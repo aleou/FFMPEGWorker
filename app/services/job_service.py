@@ -39,6 +39,7 @@ class JobService:
             job_type=payload.job_type,
             metadata=payload.metadata,
             watermark_removal_config=payload.watermark_removal_config,
+            result_url=None,
         )
         self._store[job_id] = job
         self._persist_store()
@@ -69,6 +70,7 @@ class JobService:
                 "status": payload.status or job.status,
                 "progress": payload.progress if payload.progress is not None else job.progress,
                 "error": payload.error or job.error,
+                "result_url": payload.result_url or job.result_url,
             }
         )
         self._store[job_id] = updated

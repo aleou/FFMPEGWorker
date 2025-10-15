@@ -50,6 +50,15 @@ class Settings(BaseSettings):
     DEFAULT_TRANSPARENT_MODE: bool = False
     DEFAULT_FORCE_FORMAT: str | None = None
 
+    # S3 Storage Settings
+    S3_ENDPOINT: str | None = None
+    S3_ACCESS_KEY_ID: str | None = None
+    S3_SECRET_ACCESS_KEY: str | None = None
+    S3_BUCKET: str | None = None
+    S3_REGION: str | None = None
+    S3_FORCE_PATH_STYLE: bool = False
+    S3_PRESIGN_TTL_SECONDS: int = 3600
+
 
 @lru_cache
 def get_settings() -> Settings:

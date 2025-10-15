@@ -10,6 +10,7 @@ from app.schemas.job import JobRead, JobStatus, JobUpdate
 from app.services.job_service import JobService
 from app.services.watermark_removal_service import WatermarkRemovalService
 from app.utils.ffmpeg import build_ffmpeg_command, run_ffmpeg_command
+from app.utils.s3_uploader import S3Uploader
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +18,15 @@ logger = logging.getLogger(__name__)
 class VideoProcessingWorker:
     """High-level orchestrator for video processing jobs."""
 
-    def __init__(self, job_service: JobService, watermark_service: WatermarkRemovalService | None = None) -> None:
+    def __init__(
+        self,
+        job_service: JobService,
+        watermark_service: WatermarkRemovalService | None = None,
+        storage_uploader: S3Uploader | None = None,
+    ) -> None:
         self._job_service = job_service
         self._watermark_service = watermark_service
+        self._storage_uploader = storage_uploader
 
     async def process_job(self, job: JobRead) -> None:
         """Execute the job lifecycle."""
@@ -94,6 +101,17 @@ class VideoProcessingWorker:
         )
 
         logger.info("Watermark removal completed: %s -> %s", input_path, result_path)
+
+        if self._storage_uploader:
+            try:
+                result_url = self._storage_uploader.store_file_and_get_url(
+                    Path(result_path),
+                    key_prefix=f"jobs/{job.id}",
+                )
+                logger.info("Uploaded result for job %s to %s", job.id, result_url)
+                self._job_service.update_job(job.id, JobUpdate(result_url=result_url))
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed to upload result for job %s: %s", job.id, exc)
 
     def _on_progress(self, job: JobRead) -> Callable[[float], Awaitable[None]]:
         async def _callback(value: float) -> None:

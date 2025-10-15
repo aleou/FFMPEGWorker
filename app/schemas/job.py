@@ -53,6 +53,7 @@ class JobRead(JobBase):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     progress: float | None = Field(default=None, ge=0.0, le=1.0)
     error: Optional[str] = None
+    result_url: AnyUrl | None = Field(default=None, description="Download URL for processed output.")
 
 
 class JobUpdate(BaseModel):
@@ -61,10 +62,15 @@ class JobUpdate(BaseModel):
     status: Optional[JobStatus] = None
     progress: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     error: Optional[str] = None
+    result_url: AnyUrl | None = Field(default=None, description="Download URL for processed output.")
 
     @model_validator(mode="after")
     def validate_payload(self) -> "JobUpdate":
-        if self.status is None and self.progress is None and self.error is None:
+        if (
+            self.status is None
+            and self.progress is None
+            and self.error is None
+            and self.result_url is None
+        ):
             raise ValueError("At least one field must be provided when updating a job.")
         return self
-

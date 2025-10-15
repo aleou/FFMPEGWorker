@@ -16,6 +16,7 @@ from app.core.config import get_settings  # noqa: E402
 from app.core.logging import configure_logging  # noqa: E402
 from app.services.job_registry import get_job_service_instance  # noqa: E402
 from app.services.watermark_removal_service import WatermarkRemovalService  # noqa: E402
+from app.utils.s3_uploader import S3Uploader  # noqa: E402
 from app.workers.video_worker import VideoProcessingWorker  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,19 @@ async def main() -> None:
         device=settings.AI_DEVICE,
         preferred_models=settings.WATERMARK_INPAINT_MODELS,
     )
-    worker = VideoProcessingWorker(job_service=job_service, watermark_service=watermark_service)
+    storage_uploader = None
+    if settings.S3_BUCKET and settings.S3_ACCESS_KEY_ID and settings.S3_SECRET_ACCESS_KEY:
+        try:
+            storage_uploader = S3Uploader(settings=settings)
+            logger.info("S3 uploader initialized for bucket %s", settings.S3_BUCKET)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to initialize S3 uploader: %s", exc)
+
+    worker = VideoProcessingWorker(
+        job_service=job_service,
+        watermark_service=watermark_service,
+        storage_uploader=storage_uploader,
+    )
 
     while True:
         has_work = False
