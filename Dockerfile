@@ -63,9 +63,9 @@ for path in cache_paths:
 PY
 
 #######################################################################
-# Stage 3 - Final runtime image
+# Stage 3 - API runtime image
 #######################################################################
-FROM base AS final
+FROM base AS final_api
 
 COPY --from=models /opt/hf-cache /opt/hf-cache
 COPY --from=models /root/.cache/torch /root/.cache/torch
@@ -78,3 +78,18 @@ WORKDIR /workspace
 EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+#######################################################################
+# Stage 4 - Serverless runtime image
+#######################################################################
+FROM base AS final_serverless
+
+COPY --from=models /opt/hf-cache /opt/hf-cache
+COPY --from=models /root/.cache/torch /root/.cache/torch
+
+ENV HF_HOME=/opt/hf-cache \
+    PATH="/workspace/.local/bin:${PATH}"
+
+WORKDIR /workspace
+
+CMD ["python", "-m", "app.serverless.runpod_handler"]

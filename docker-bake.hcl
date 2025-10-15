@@ -11,7 +11,7 @@ variable "RELEASE_VERSION" {
 }
 
 group "default" {
-  targets = ["base", "final"]
+  targets = ["final-api", "final-serverless"]
 }
 
 target "base" {
@@ -22,14 +22,26 @@ target "base" {
   tags       = ["${REGISTRY}/${IMAGE}:${RELEASE_VERSION}-base"]
 }
 
-target "final" {
+target "final-api" {
   context    = "."
   dockerfile = "Dockerfile"
-  target     = "final"
+  target     = "final_api"
   platforms  = ["linux/amd64"]
   tags       = [
-    "${REGISTRY}/${IMAGE}:${RELEASE_VERSION}",
-    "${REGISTRY}/${IMAGE}:latest",
+    "${REGISTRY}/${IMAGE}:${RELEASE_VERSION}-api",
+    "${REGISTRY}/${IMAGE}:latest-api",
+  ]
+  inherits = ["base"]
+}
+
+target "final-serverless" {
+  context    = "."
+  dockerfile = "Dockerfile"
+  target     = "final_serverless"
+  platforms  = ["linux/amd64"]
+  tags       = [
+    "${REGISTRY}/${IMAGE}:${RELEASE_VERSION}-serverless",
+    "${REGISTRY}/${IMAGE}:latest-serverless",
   ]
   inherits = ["base"]
 }
