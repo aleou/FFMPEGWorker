@@ -124,6 +124,9 @@ class WatermarkRemovalService:
         self.device = device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
         self._cuda_capability = self._detect_cuda_capability()
         
+        # Auto-detect GPU and configure optimal parameters
+        self._configure_gpu_parameters()
+        
         # Optimize CUDA settings for better GPU utilization
         if self.device.startswith("cuda") and torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True  # Auto-tune for best performance
@@ -194,6 +197,48 @@ class WatermarkRemovalService:
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(f"Unable to read CUDA capability ({exc}); assuming no CUDA acceleration.")
             return None
+
+    def _configure_gpu_parameters(self) -> None:
+        """Auto-detect GPU and configure optimal batch sizes and segment frames."""
+        if not torch.cuda.is_available():
+            logger.info("No CUDA available - using default CPU parameters")
+            return
+        
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            
+            logger.info(f"Detected GPU: {gpu_name} with {vram_gb:.1f} GB VRAM")
+            
+            # Configure based on VRAM and GPU tier
+            if vram_gb >= 24:  # High-end: RTX 4090, RTX 5090, A100, etc.
+                self.YOLO_BATCH_SIZE = 32
+                self.INPAINT_BATCH_SIZE = 16
+                self.GPU_SEGMENT_FRAMES = 450
+                logger.info(f"High-end GPU config: YOLO batch={self.YOLO_BATCH_SIZE}, Inpaint batch={self.INPAINT_BATCH_SIZE}, Segment={self.GPU_SEGMENT_FRAMES}")
+            elif vram_gb >= 16:  # Mid-high: RTX 4080, A40, etc.
+                self.YOLO_BATCH_SIZE = 24
+                self.INPAINT_BATCH_SIZE = 12
+                self.GPU_SEGMENT_FRAMES = 360
+                logger.info(f"Mid-high GPU config: YOLO batch={self.YOLO_BATCH_SIZE}, Inpaint batch={self.INPAINT_BATCH_SIZE}, Segment={self.GPU_SEGMENT_FRAMES}")
+            elif vram_gb >= 10:  # Mid: RTX 3080, RTX 4070, etc.
+                self.YOLO_BATCH_SIZE = 20
+                self.INPAINT_BATCH_SIZE = 10
+                self.GPU_SEGMENT_FRAMES = 300
+                logger.info(f"Mid-range GPU config: YOLO batch={self.YOLO_BATCH_SIZE}, Inpaint batch={self.INPAINT_BATCH_SIZE}, Segment={self.GPU_SEGMENT_FRAMES}")
+            elif vram_gb >= 8:  # Entry: RTX 3070, RTX 4060, etc.
+                self.YOLO_BATCH_SIZE = 16
+                self.INPAINT_BATCH_SIZE = 8
+                self.GPU_SEGMENT_FRAMES = 240
+                logger.info(f"Entry GPU config: YOLO batch={self.YOLO_BATCH_SIZE}, Inpaint batch={self.INPAINT_BATCH_SIZE}, Segment={self.GPU_SEGMENT_FRAMES}")
+            else:  # Low VRAM: < 8GB
+                self.YOLO_BATCH_SIZE = 12
+                self.INPAINT_BATCH_SIZE = 6
+                self.GPU_SEGMENT_FRAMES = 180
+                logger.info(f"Low VRAM GPU config: YOLO batch={self.YOLO_BATCH_SIZE}, Inpaint batch={self.INPAINT_BATCH_SIZE}, Segment={self.GPU_SEGMENT_FRAMES}")
+                
+        except Exception as exc:
+            logger.warning(f"Failed to detect GPU specs ({exc}); using default parameters")
 
     def _resolve_inpaint_candidates(self, preferred: Sequence[str] | str | None) -> list[str]:
         raw: list[str]
@@ -1523,10 +1568,18 @@ class WatermarkRemovalService:
         force_format: Optional[str],
         detector: str | None,
     ) -> Path:
-        segments, info = self._decode_video_segments(input_path, self.GPU_SEGMENT_FRAMES)
+        logger.info("GPU pipeline: Starting video decode...")
+        try:
+            segments, info = self._decode_video_segments(input_path, self.GPU_SEGMENT_FRAMES)
+            logger.info(f"GPU pipeline: Decoded {len(segments)} segments")
+        except Exception as e:
+            logger.error(f"GPU pipeline: Video decode failed - {type(e).__name__}: {str(e)}")
+            raise
+        
         width = info["width"]
         height = info["height"]
         fps = info["fps"]
+        logger.info(f"GPU pipeline: Video specs - {width}x{height} @ {fps:.2f} fps")
 
         if force_format:
             output_format = force_format.upper()
@@ -1557,9 +1610,15 @@ class WatermarkRemovalService:
                 )
                 boxes_per_frame = []
 
-        frames_rgb, pil_frames = self._segments_to_cpu_frames(segments)
-        if not frames_rgb:
-            raise RuntimeError("No frames decoded from input video.")
+        logger.info("GPU pipeline: Converting segments to CPU frames...")
+        try:
+            frames_rgb, pil_frames = self._segments_to_cpu_frames(segments)
+            if not frames_rgb:
+                raise RuntimeError("No frames decoded from input video.")
+            logger.info(f"GPU pipeline: Converted {len(frames_rgb)} frames successfully")
+        except Exception as e:
+            logger.error(f"GPU pipeline: Frame conversion failed - {type(e).__name__}: {str(e)}")
+            raise
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
