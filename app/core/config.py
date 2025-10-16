@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     FLORENCE_MODEL_CACHE_DIR: Path | None = None
     LAMA_MODEL_CACHE_DIR: Path | None = None
     WATERMARK_INPAINT_MODELS: str = "auto"  # e.g. "zits", "lama", "lama,zits", or "auto"
+    WATERMARK_DETECTOR_DEFAULT: Literal["flo", "florence", "yolo"] = "flo"
+    WATERMARK_YOLO_MODEL_URL: str = (
+        "https://huggingface.co/hellostevelo/sora_watermark-yolov11s/resolve/main/sora_watermark-yolov11s.pt"
+    )
+    WATERMARK_YOLO_MODEL_CACHE_DIR: Path | None = None
 
     # Watermark Removal Defaults
     DEFAULT_MAX_BBOX_PERCENT: float = 10.0

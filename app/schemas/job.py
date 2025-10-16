@@ -18,6 +18,21 @@ class WatermarkRemovalConfig(BaseModel):
     max_bbox_percent: float = Field(default=10.0, ge=1.0, le=100.0, description="Maximum percentage of image area a bounding box can cover.")
     force_format: str | None = Field(default=None, description="Force output format (PNG, WEBP, JPG, MP4, AVI).")
     overwrite: bool = Field(default=False, description="Overwrite existing output files.")
+    detector: str | None = Field(
+        default=None,
+        description="Watermark detection backend to use: 'flo' (Florence-2) or 'yolo'.",
+    )
+
+    @model_validator(mode="after")
+    def normalize_detector(self) -> "WatermarkRemovalConfig":
+        if self.detector is None:
+            return self
+
+        normalized = self.detector.lower()
+        if normalized not in {"flo", "florence", "yolo"}:
+            raise ValueError("detector must be 'flo', 'florence', or 'yolo'.")
+        self.detector = normalized
+        return self
 
 
 class JobStatus(str, Enum):

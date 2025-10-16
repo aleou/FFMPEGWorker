@@ -8,11 +8,13 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 from enum import Enum
 
 import cv2
 import numpy as np
 import torch
+import requests
 from loguru import logger
 from PIL import Image, ImageDraw, UnidentifiedImageError
 try:
@@ -34,6 +36,12 @@ from iopaint.model_manager import ModelManager
 from iopaint.schema import HDStrategy, LDMSampler, InpaintRequest as Config
 import tqdm
 
+Detection = tuple[tuple[int, int, int, int], Optional[str], Optional[float]]
+DEFAULT_YOLO_MODEL_URL = (
+    "https://huggingface.co/hellostevelo/sora_watermark-yolov11s/resolve/main/sora_watermark-yolov11s.pt"
+)
+DEFAULT_YOLO_CACHE_SUBDIR = "watermark_yolo"
+
 
 class TaskType(str, Enum):
     """Task types for Florence-2 model."""
@@ -53,6 +61,7 @@ class WatermarkRemovalService:
         "channel",
         "branding",
         "corner text",
+        "sora logo",
     )
     WATERMARK_NEGATIVE_KEYWORDS = (
         "traffic",
@@ -74,12 +83,18 @@ class WatermarkRemovalService:
         self,
         device: str = "auto",
         preferred_models: Sequence[str] | str | None = None,
+        default_detector: str | None = None,
+        yolo_model_url: str | None = None,
+        yolo_cache_dir: Path | None = None,
     ):
         """Initialize the watermark removal service.
 
         Args:
             device: Device to run models on ('cuda', 'cpu', or 'auto')
             preferred_models: Preferred inpainting model(s) in order of priority.
+            default_detector: Default detection backend ('flo'/'florence' or 'yolo').
+            yolo_model_url: Optional override URL for the YOLO watermark detector weights.
+            yolo_cache_dir: Optional directory to cache YOLO detector weights.
         """
         self.device = device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
         self._cuda_capability = self._detect_cuda_capability()
@@ -91,6 +106,13 @@ class WatermarkRemovalService:
         self.inpaint_model_manager: Optional[ModelManager] = None
         self._inpaint_device: torch.device | None = None
         self._active_inpaint_model: str | None = None
+        self.default_detector = self._resolve_detector(default_detector)
+        self._yolo_model_url = yolo_model_url or DEFAULT_YOLO_MODEL_URL
+        self._yolo_cache_dir = Path(yolo_cache_dir) if yolo_cache_dir else Path.home() / ".cache" / DEFAULT_YOLO_CACHE_SUBDIR
+        self._yolo_model_path: Path | None = None
+        self._yolo_model = None
+        self._yolo_device: str | None = None
+        self._yolo_cache_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(
             f"Using device: {self.device} (inpaint preferences: {', '.join(self._inpaint_candidates)})"
@@ -99,6 +121,32 @@ class WatermarkRemovalService:
     @staticmethod
     def _coerce_device(device: str | torch.device) -> torch.device:
         return device if isinstance(device, torch.device) else torch.device(device)
+
+    def _resolve_detector(self, detector: str | None) -> str:
+        if detector is None:
+            return "florence"
+
+        value = detector.lower()
+        if value in {"flo", "florence", "fl"}:
+            return "florence"
+        if value == "yolo":
+            return "yolo"
+
+        logger.warning("Unknown detector '%s'; defaulting to Florence-2.", detector)
+        return "florence"
+
+    def _effective_detector(self, detector: str | None) -> str:
+        if detector is None:
+            return self.default_detector
+
+        value = detector.lower()
+        if value in {"flo", "florence", "fl"}:
+            return "florence"
+        if value == "yolo":
+            return "yolo"
+
+        logger.warning("Unknown detector override '%s'; using default '%s'.", detector, self.default_detector)
+        return self.default_detector
 
     def _detect_cuda_capability(self) -> float | None:
         if not torch.cuda.is_available():
@@ -212,18 +260,21 @@ class WatermarkRemovalService:
         if self.inpaint_model_manager is None:
             self._initialize_inpaint_model()
 
+    def _ensure_florence_model(self) -> None:
+        if self.florence_model is not None and self.florence_processor is not None:
+            return
+        logger.info("Loading Florence-2 model...")
+        self.florence_model = AutoModelForCausalLM.from_pretrained(
+            "microsoft/Florence-2-large", trust_remote_code=True
+        ).to(self.device).eval()
+        self.florence_processor = AutoProcessor.from_pretrained(
+            "microsoft/Florence-2-large", trust_remote_code=True
+        )
+        logger.info("Florence-2 model loaded")
+
     def _load_models(self):
         """Load the AI models if not already loaded."""
-        if self.florence_model is None:
-            logger.info("Loading Florence-2 model...")
-            self.florence_model = AutoModelForCausalLM.from_pretrained(
-                "microsoft/Florence-2-large", trust_remote_code=True
-            ).to(self.device).eval()
-            self.florence_processor = AutoProcessor.from_pretrained(
-                "microsoft/Florence-2-large", trust_remote_code=True
-            )
-            logger.info("Florence-2 model loaded")
-
+        self._ensure_florence_model()
         self._ensure_inpaint_model()
 
     def _identify_watermark(self, image: Image.Image, text_input: str) -> dict:
@@ -236,6 +287,7 @@ class WatermarkRemovalService:
         Returns:
             Parsed detection results
         """
+        self._ensure_florence_model()
         task_prompt = TaskType.OPEN_VOCAB_DETECTION
         prompt = task_prompt.value + text_input
 
@@ -333,7 +385,61 @@ class WatermarkRemovalService:
         filled = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, kernel, iterations=1)
         return filled
 
-    def _get_watermark_mask(self, image: Image.Image, max_bbox_percent: float) -> Image.Image:
+    def _download_yolo_model(self) -> Path:
+        if self._yolo_model_path and self._yolo_model_path.exists():
+            return self._yolo_model_path
+
+        if not self._yolo_model_url:
+            raise RuntimeError("YOLO detector requested but no model URL is configured.")
+
+        parsed = urlparse(self._yolo_model_url)
+        filename = Path(parsed.path).name or "watermark_yolo.pt"
+        target_path = self._yolo_cache_dir / filename
+        if target_path.exists():
+            self._yolo_model_path = target_path
+            return target_path
+
+        logger.info("Downloading YOLO watermark detector weights from %s", self._yolo_model_url)
+        response = requests.get(self._yolo_model_url, stream=True, timeout=180)
+        response.raise_for_status()
+        with target_path.open("wb") as fh:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    fh.write(chunk)
+        logger.info("YOLO watermark detector stored at %s", target_path)
+        self._yolo_model_path = target_path
+        return target_path
+
+    def _ensure_yolo_model(self) -> None:
+        if self._yolo_model is not None:
+            return
+        try:
+            from ultralytics import YOLO  # type: ignore
+        except ImportError as exc:  # pragma: no cover - dependency missing
+            raise RuntimeError(
+                "YOLO detector requested but the 'ultralytics' package is not installed."
+            ) from exc
+
+        model_path = self._download_yolo_model()
+        self._yolo_model = YOLO(str(model_path))
+
+        if str(self.device).startswith("cuda"):
+            target_device = str(self.device) if ":" in str(self.device) else f"{self.device}:0"
+        else:
+            target_device = "cpu"
+
+        try:
+            self._yolo_model.to(target_device)
+            self._yolo_device = target_device
+        except Exception as exc:  # pragma: no cover - defensive
+            self._yolo_device = None
+            logger.warning(
+                "Unable to move YOLO detector to %s (%s). Falling back to default device.",
+                target_device,
+                exc,
+            )
+
+    def _detect_watermarks_with_florence(self, image: Image.Image) -> list[Detection]:
         """Generate a mask for watermark regions.
 
         Args:
@@ -346,20 +452,82 @@ class WatermarkRemovalService:
         text_input = "watermark logo sora"
         parsed_answer = self._identify_watermark(image, text_input)
 
-        mask = Image.new("L", image.size, 0)
-        draw = ImageDraw.Draw(mask)
-
         detection_key = "<OPEN_VOCABULARY_DETECTION>"
         detections = parsed_answer.get(detection_key) or {}
         bboxes = detections.get("bboxes") or []
         labels = detections.get("labels") or []
         scores = detections.get("scores") or detections.get("confidences") or []
+        collected: list[Detection] = []
 
         for idx, bbox in enumerate(bboxes):
             x1, y1, x2, y2 = map(int, bbox)
             label = labels[idx] if idx < len(labels) else None
             score = scores[idx] if idx < len(scores) else None
+            try:
+                score_value = float(score) if score is not None else None
+            except (TypeError, ValueError):
+                score_value = None
+            collected.append(((x1, y1, x2, y2), label, score_value))
 
+        return collected
+
+    def _detect_watermarks_with_yolo(self, image: Image.Image) -> list[Detection]:
+        self._ensure_yolo_model()
+        if self._yolo_model is None:
+            return []
+
+        image_np = np.array(image)
+        predict_kwargs: dict[str, object] = {"verbose": False}
+        if self._yolo_device:
+            predict_kwargs["device"] = self._yolo_device
+        results = self._yolo_model.predict(image_np, **predict_kwargs)
+        if not results:
+            return []
+
+        result = results[0]
+        boxes = getattr(result, "boxes", None)
+        if boxes is None or boxes.xyxy is None:
+            return []
+
+        names = getattr(result, "names", None) or getattr(self._yolo_model, "names", {})
+
+        detections: list[Detection] = []
+        for idx in range(len(boxes)):
+            xyxy = boxes.xyxy[idx].tolist()
+            conf_value: Optional[float] = None
+            if boxes.conf is not None:
+                conf_value = float(boxes.conf[idx])
+            cls_value: Optional[int] = None
+            if boxes.cls is not None:
+                cls_value = int(boxes.cls[idx])
+
+            label: Optional[str] = None
+            if cls_value is not None:
+                if isinstance(names, dict):
+                    label = names.get(cls_value)
+                elif isinstance(names, (list, tuple)) and 0 <= cls_value < len(names):
+                    label = names[cls_value]
+
+            x1, y1, x2, y2 = map(int, xyxy)
+            x1 = max(0, min(x1, image.width - 1))
+            y1 = max(0, min(y1, image.height - 1))
+            x2 = max(0, min(x2, image.width))
+            y2 = max(0, min(y2, image.height))
+            detections.append(((x1, y1, x2, y2), label, conf_value))
+
+        return detections
+
+    def _build_mask_from_detections(
+        self,
+        image: Image.Image,
+        detections: list[Detection],
+        max_bbox_percent: float,
+    ) -> Image.Image:
+        mask = Image.new("L", image.size, 0)
+        draw = ImageDraw.Draw(mask)
+
+        for bbox, label, score in detections:
+            x1, y1, x2, y2 = bbox
             if not self._is_plausible_watermark_box(
                 (x1, y1, x2, y2),
                 label,
@@ -375,6 +543,27 @@ class WatermarkRemovalService:
         mask_array = np.array(mask, dtype=np.uint8)
         refined = self._refine_mask(mask_array)
         return Image.fromarray(refined, mode="L")
+
+    def _get_watermark_mask(
+        self,
+        image: Image.Image,
+        max_bbox_percent: float,
+        detector: str | None = None,
+    ) -> Image.Image:
+        backend = self._effective_detector(detector)
+        detections: list[Detection] = []
+
+        if backend == "yolo":
+            try:
+                detections = self._detect_watermarks_with_yolo(image)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("YOLO detection failed (%s). Falling back to Florence-2.", exc)
+                backend = "florence"
+
+        if backend == "florence":
+            detections = self._detect_watermarks_with_florence(image)
+
+        return self._build_mask_from_detections(image, detections, max_bbox_percent)
 
     def _process_image_with_inpainter(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """Remove watermarks from an image using the configured inpainting model.
@@ -479,7 +668,8 @@ class WatermarkRemovalService:
         output_path: Path,
         transparent: bool,
         max_bbox_percent: float,
-        force_format: Optional[str]
+        force_format: Optional[str],
+        detector: str | None,
     ) -> Path:
         """Process a video file for watermark removal.
 
@@ -489,6 +679,7 @@ class WatermarkRemovalService:
             transparent: Whether to make watermarks transparent
             max_bbox_percent: Maximum bbox percentage
             force_format: Forced output format
+            detector: Detection backend override
 
         Returns:
             Path to processed video
@@ -545,17 +736,10 @@ class WatermarkRemovalService:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_image = Image.fromarray(frame_rgb)
 
-                refresh_mask = combined_mask_array is None or frame_count % detection_interval == 0
+                refresh_mask = mask_image_cached is None or frame_count % detection_interval == 0
                 if refresh_mask:
-                    current_mask = self._get_watermark_mask(pil_image, max_bbox_percent)
-                    mask_np = np.array(current_mask, dtype=np.uint8)
-                    if mask_np.max() > 0:
-                        combined_mask_array = (
-                            mask_np if combined_mask_array is None else np.maximum(combined_mask_array, mask_np)
-                        )
-                    elif combined_mask_array is None:
-                        combined_mask_array = mask_np
-                    mask_image_cached = Image.fromarray(combined_mask_array, mode="L")
+                    mask_image_cached = self._get_watermark_mask(pil_image, max_bbox_percent, detector)
+                    combined_mask_array = np.array(mask_image_cached, dtype=np.uint8)
                 elif combined_mask_array is None:
                     combined_mask_array = np.zeros((height, width), dtype=np.uint8)
                     mask_image_cached = Image.fromarray(combined_mask_array, mode="L")
@@ -656,7 +840,8 @@ class WatermarkRemovalService:
         transparent: bool = False,
         max_bbox_percent: float = 10.0,
         force_format: Optional[str] = None,
-        overwrite: bool = False
+        detector: str | None = None,
+        overwrite: bool = False,
     ) -> Path:
         """Process a file (image or video) for watermark removal.
 
@@ -666,13 +851,26 @@ class WatermarkRemovalService:
             transparent: Make watermark areas transparent
             max_bbox_percent: Maximum bbox percentage
             force_format: Force output format
+            detector: Detection backend override ('flo'/'florence' or 'yolo')
             overwrite: Overwrite existing files
 
         Returns:
             Path to processed file
         """
-        # Load models if needed
-        self._load_models()
+        detector_choice = self._effective_detector(detector)
+
+        if detector_choice == "florence":
+            self._ensure_florence_model()
+        else:
+            try:
+                self._ensure_yolo_model()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed to initialize YOLO detector (%s); falling back to Florence-2.", exc)
+                detector_choice = "florence"
+                self._ensure_florence_model()
+
+        self._ensure_inpaint_model()
+        logger.info("Using '%s' detector for %s", detector_choice, input_path.name)
 
         if output_path.exists() and not overwrite:
             logger.info(f"Skipping existing file: {output_path}")
@@ -680,7 +878,14 @@ class WatermarkRemovalService:
 
         # Check if it's a video
         if self._is_video_file(input_path):
-            return self._process_video(input_path, output_path, transparent, max_bbox_percent, force_format)
+            return self._process_video(
+                input_path,
+                output_path,
+                transparent,
+                max_bbox_percent,
+                force_format,
+                detector_choice,
+            )
 
         # Process image
         try:
@@ -692,8 +897,15 @@ class WatermarkRemovalService:
                 input_path,
                 exc,
             )
-            return self._process_video(input_path, output_path, transparent, max_bbox_percent, force_format)
-        mask_image = self._get_watermark_mask(image, max_bbox_percent)
+            return self._process_video(
+                input_path,
+                output_path,
+                transparent,
+                max_bbox_percent,
+                force_format,
+                detector_choice,
+            )
+        mask_image = self._get_watermark_mask(image, max_bbox_percent, detector_choice)
 
         if transparent:
             result_image = self._make_region_transparent(image, mask_image)

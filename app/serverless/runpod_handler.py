@@ -22,6 +22,9 @@ SETTINGS = get_settings()
 SERVICE = WatermarkRemovalService(
     device=SETTINGS.AI_DEVICE,
     preferred_models=SETTINGS.WATERMARK_INPAINT_MODELS,
+    default_detector=SETTINGS.WATERMARK_DETECTOR_DEFAULT,
+    yolo_model_url=SETTINGS.WATERMARK_YOLO_MODEL_URL,
+    yolo_cache_dir=SETTINGS.WATERMARK_YOLO_MODEL_CACHE_DIR,
 )
 
 
@@ -160,6 +163,7 @@ def _process_job(job_input: dict[str, Any], job_id: str | None) -> dict[str, Any
 
         config_payload = job_input.get("watermark_config") or {}
         config = WatermarkRemovalConfig.model_validate(config_payload)
+        detector_choice = config.detector or SETTINGS.WATERMARK_DETECTOR_DEFAULT
 
         result_path = SERVICE.process_file(
             input_path=input_path,
@@ -167,6 +171,7 @@ def _process_job(job_input: dict[str, Any], job_id: str | None) -> dict[str, Any
             transparent=config.transparent,
             max_bbox_percent=config.max_bbox_percent,
             force_format=config.force_format,
+            detector=detector_choice,
             overwrite=config.overwrite,
         )
 

@@ -97,6 +97,7 @@ class VideoProcessingWorker:
             transparent=config.transparent,
             max_bbox_percent=config.max_bbox_percent,
             force_format=config.force_format,
+            detector=config.detector,
             overwrite=config.overwrite
         )
 

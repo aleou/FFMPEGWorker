@@ -36,6 +36,9 @@ def get_watermark_removal_service(settings: SettingsDep) -> Iterator[WatermarkRe
     service = WatermarkRemovalService(
         device=settings.AI_DEVICE,
         preferred_models=settings.WATERMARK_INPAINT_MODELS,
+        default_detector=settings.WATERMARK_DETECTOR_DEFAULT,
+        yolo_model_url=settings.WATERMARK_YOLO_MODEL_URL,
+        yolo_cache_dir=settings.WATERMARK_YOLO_MODEL_CACHE_DIR,
     )
     yield service
 
