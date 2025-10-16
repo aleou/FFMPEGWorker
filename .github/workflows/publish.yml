@@ -2,8 +2,8 @@ name: Publish Docker Images
 
 on:
   push:
-    tags:
-      - "v*.*"
+    branches:
+      - main
 
 env:
   DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY || 'aleou' }}
@@ -30,10 +30,5 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push images
-        env:
-          RELEASE_VERSION: ${{ github.ref_name }}
-        run: |
-          docker buildx bake base final-api final-serverless --push \
-            --set REGISTRY=${DOCKER_REGISTRY} \
-            --set IMAGE=${DOCKER_IMAGE} \
-            --set RELEASE_VERSION=${RELEASE_VERSION}
+        run: docker buildx bake --push
+
