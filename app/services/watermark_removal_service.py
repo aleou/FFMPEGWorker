@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 import torch
 from loguru import logger
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, UnidentifiedImageError
 from transformers import AutoProcessor, AutoModelForCausalLM
 from iopaint.model.lama import LaMa
 from iopaint.model.zits import ZITS
@@ -516,7 +516,16 @@ class WatermarkRemovalService:
             return self._process_video(input_path, output_path, transparent, max_bbox_percent, force_format)
 
         # Process image
-        image = Image.open(input_path).convert("RGB")
+        try:
+            with Image.open(input_path) as pil_image:
+                image = pil_image.convert("RGB")
+        except (UnidentifiedImageError, OSError) as exc:
+            logger.info(
+                "Input %s not recognized as image (%s); attempting video pipeline instead.",
+                input_path,
+                exc,
+            )
+            return self._process_video(input_path, output_path, transparent, max_bbox_percent, force_format)
         mask_image = self._get_watermark_mask(image, max_bbox_percent)
 
         if transparent:
