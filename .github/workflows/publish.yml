@@ -1,9 +1,7 @@
 name: Publish Docker Images
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:  # Déclenchement manuel uniquement
 
 env:
   DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY || 'aleou' }}
