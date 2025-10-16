@@ -1133,10 +1133,19 @@ class WatermarkRemovalService:
             self._ensure_inpaint_model()
             assert self.inpaint_model_manager is not None
             model_name = self._active_inpaint_model or "unknown"
-            use_autocast = self._inpaint_device is not None and self._inpaint_device.type == "cuda"
+
+            use_autocast = (
+                self._inpaint_device is not None
+                and self._inpaint_device.type == "cuda"
+                and model_name != "lama"
+            )
+
             try:
                 with torch.inference_mode():
-                    ctx = torch.cuda.amp.autocast(enabled=use_autocast) if torch.cuda.is_available() else nullcontext()
+                    if use_autocast and torch.cuda.is_available():
+                        ctx = torch.amp.autocast("cuda")
+                    else:
+                        ctx = nullcontext()
                     with ctx:  # type: ignore[arg-type]
                         result = self.inpaint_model_manager(image, mask, config)
                 break
