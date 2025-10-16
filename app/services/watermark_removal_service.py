@@ -44,6 +44,31 @@ class WatermarkRemovalService:
     """Service for detecting and removing watermarks from videos using AI models."""
 
     SUPPORTED_INPAINT_MODELS = ("lama", "zits", "cv2")
+    WATERMARK_POSITIVE_KEYWORDS = (
+        "watermark",
+        "logo",
+        "overlay",
+        "bug",
+        "subtitle",
+        "channel",
+        "branding",
+        "corner text",
+    )
+    WATERMARK_NEGATIVE_KEYWORDS = (
+        "traffic",
+        "road",
+        "sign",
+        "billboard",
+        "street",
+        "vehicle",
+        "person",
+        "car",
+        "truck",
+        "bus",
+        "bike",
+        "pedestrian",
+    )
+    WATERMARK_MIN_SCORE = 0.18
 
     def __init__(
         self,
@@ -234,6 +259,80 @@ class WatermarkRemovalService:
             generated_text, task=task_prompt.value, image_size=(image.width, image.height)
         )
 
+    @staticmethod
+    def _box_area(bbox: Sequence[int]) -> int:
+        x1, y1, x2, y2 = bbox
+        return max(0, x2 - x1) * max(0, y2 - y1)
+
+    @staticmethod
+    def _box_center(bbox: Sequence[int]) -> tuple[float, float]:
+        x1, y1, x2, y2 = bbox
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+    @staticmethod
+    def _is_near_border(bbox: Sequence[int], width: int, height: int, margin_ratio: float = 0.18) -> bool:
+        x1, y1, x2, y2 = bbox
+        margin_w = width * margin_ratio
+        margin_h = height * margin_ratio
+        return (
+            x1 <= margin_w
+            or y1 <= margin_h
+            or x2 >= width - margin_w
+            or y2 >= height - margin_h
+        )
+
+    def _is_plausible_watermark_box(
+        self,
+        bbox: Sequence[int],
+        label: str | None,
+        score: float | None,
+        width: int,
+        height: int,
+        max_bbox_percent: float,
+    ) -> bool:
+        if score is not None and score < self.WATERMARK_MIN_SCORE:
+            return False
+
+        bbox_area = self._box_area(bbox)
+        if bbox_area == 0:
+            return False
+
+        image_area = width * height
+        if (bbox_area / image_area) * 100 > max_bbox_percent:
+            return False
+
+        label_normalized = (label or "").lower().strip()
+        if label_normalized:
+            if any(term in label_normalized for term in self.WATERMARK_NEGATIVE_KEYWORDS):
+                return False
+
+        is_edge_candidate = self._is_near_border(bbox, width, height)
+        label_suggests_watermark = label_normalized and any(
+            key in label_normalized for key in self.WATERMARK_POSITIVE_KEYWORDS
+        )
+
+        if not label_suggests_watermark and not is_edge_candidate:
+            # Central detections without matching keywords are likely content (e.g., road signs)
+            return False
+
+        # Discard extremely tall/narrow detections that do not resemble typical overlays.
+        x1, y1, x2, y2 = bbox
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        aspect_ratio = max(w / h, h / w)
+        if aspect_ratio > 25 and not label_suggests_watermark:
+            return False
+
+        return True
+
+    def _refine_mask(self, mask: np.ndarray) -> np.ndarray:
+        if mask.size == 0 or mask.max() == 0:
+            return mask
+        kernel = np.ones((3, 3), np.uint8)
+        dilated = cv2.dilate(mask, kernel, iterations=1)
+        filled = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, kernel, iterations=1)
+        return filled
+
     def _get_watermark_mask(self, image: Image.Image, max_bbox_percent: float) -> Image.Image:
         """Generate a mask for watermark regions.
 
@@ -251,20 +350,31 @@ class WatermarkRemovalService:
         draw = ImageDraw.Draw(mask)
 
         detection_key = "<OPEN_VOCABULARY_DETECTION>"
-        if detection_key in parsed_answer and "bboxes" in parsed_answer[detection_key]:
-            image_area = image.width * image.height
-            for bbox in parsed_answer[detection_key]["bboxes"]:
-                x1, y1, x2, y2 = map(int, bbox)
-                bbox_area = (x2 - x1) * (y2 - y1)
-                if (bbox_area / image_area) * 100 <= max_bbox_percent:
-                    draw.rectangle([x1, y1, x2, y2], fill=255)
-                else:
-                    logger.warning(
-                        f"Skipping large bounding box: {bbox} covering "
-                        f"{bbox_area / image_area:.2%} of the image"
-                    )
+        detections = parsed_answer.get(detection_key) or {}
+        bboxes = detections.get("bboxes") or []
+        labels = detections.get("labels") or []
+        scores = detections.get("scores") or detections.get("confidences") or []
 
-        return mask
+        for idx, bbox in enumerate(bboxes):
+            x1, y1, x2, y2 = map(int, bbox)
+            label = labels[idx] if idx < len(labels) else None
+            score = scores[idx] if idx < len(scores) else None
+
+            if not self._is_plausible_watermark_box(
+                (x1, y1, x2, y2),
+                label,
+                score,
+                image.width,
+                image.height,
+                max_bbox_percent,
+            ):
+                continue
+
+            draw.rectangle([x1, y1, x2, y2], fill=255)
+
+        mask_array = np.array(mask, dtype=np.uint8)
+        refined = self._refine_mask(mask_array)
+        return Image.fromarray(refined, mode="L")
 
     def _process_image_with_inpainter(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """Remove watermarks from an image using the configured inpainting model.
@@ -419,6 +529,10 @@ class WatermarkRemovalService:
 
         out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
 
+        detection_interval = max(1, int(round(fps)) or 1)
+        combined_mask_array: np.ndarray | None = None
+        mask_image_cached: Image.Image | None = None
+
         # Process each frame
         with tqdm.tqdm(total=total_frames, desc="Processing video frames") as pbar:
             frame_count = 0
@@ -431,8 +545,25 @@ class WatermarkRemovalService:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_image = Image.fromarray(frame_rgb)
 
-                # Get watermark mask
-                mask_image = self._get_watermark_mask(pil_image, max_bbox_percent)
+                refresh_mask = combined_mask_array is None or frame_count % detection_interval == 0
+                if refresh_mask:
+                    current_mask = self._get_watermark_mask(pil_image, max_bbox_percent)
+                    mask_np = np.array(current_mask, dtype=np.uint8)
+                    if mask_np.max() > 0:
+                        combined_mask_array = (
+                            mask_np if combined_mask_array is None else np.maximum(combined_mask_array, mask_np)
+                        )
+                    elif combined_mask_array is None:
+                        combined_mask_array = mask_np
+                    mask_image_cached = Image.fromarray(combined_mask_array, mode="L")
+                elif combined_mask_array is None:
+                    combined_mask_array = np.zeros((height, width), dtype=np.uint8)
+                    mask_image_cached = Image.fromarray(combined_mask_array, mode="L")
+
+                mask_np = combined_mask_array if combined_mask_array is not None else np.zeros(
+                    (height, width), dtype=np.uint8
+                )
+                mask_image = mask_image_cached if mask_image_cached is not None else Image.fromarray(mask_np, mode="L")
 
                 # Process frame
                 if transparent:
@@ -443,7 +574,7 @@ class WatermarkRemovalService:
                     result_image = background
                 else:
                     inpaint_result = self._process_image_with_inpainter(
-                        np.array(pil_image), np.array(mask_image)
+                        np.array(pil_image), mask_np
                     )
                     result_image = Image.fromarray(
                         cv2.cvtColor(inpaint_result, cv2.COLOR_BGR2RGB)
