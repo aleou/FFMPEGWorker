@@ -104,6 +104,7 @@ typer-config==1.4.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 ultralytics==8.3.38
+av==12.1.0
 tzdata==2025.2
 urllib3==2.5.0
 uvicorn==0.37.0

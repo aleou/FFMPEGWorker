@@ -8,6 +8,7 @@ import tempfile
 import json
 import math
 import shutil
+from contextlib import nullcontext
 from collections import deque
 from collections.abc import Sequence
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Optional, Any
 from urllib.parse import urlparse
 from enum import Enum
 
+import av
 import cv2
 import numpy as np
 import torch
@@ -95,6 +97,12 @@ class WatermarkRemovalService:
     WATERMARK_PERSISTENCE_FRAMES = 12  # keep detections alive for ~0.5s @24fps
     WATERMARK_ACCUMULATION_SECONDS = 1.5
     YOLO_BATCH_SIZE = 4
+    GPU_SEGMENT_FRAMES = 180
+    WATERMARK_LOOKBACK_FRAMES = 6
+    WATERMARK_LOOKAHEAD_SECONDS = 1.0
+    WATERMARK_POSITION_THRESHOLD = 0.12  # proportion of diagonal distance
+    WATERMARK_MAX_GAP_FRAMES = 3
+    INPAINT_BATCH_SIZE = 4
 
     def __init__(
         self,
@@ -372,6 +380,206 @@ class WatermarkRemovalService:
             "frames": total_frames,
             "duration": duration,
         }
+
+    def _extract_audio_track(self, input_path: Path, workdir: Path) -> Path | None:
+        ffmpeg_bin = self._ffmpeg_path("ffmpeg")
+        audio_path = workdir / "audio_track.mka"
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-map",
+            "0:a?",
+            "-c:a",
+            "copy",
+            str(audio_path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as exc:  # pragma: no cover - depends on ffmpeg
+            logger.warning("Audio extraction failed (%s). Continuing without audio.", exc)
+            return None
+
+        if audio_path.exists() and audio_path.stat().st_size > 0:
+            return audio_path
+        return None
+
+    def _decode_video_segments(
+        self,
+        input_path: Path,
+        segment_frames: int | None = None,
+    ) -> tuple[list[torch.Tensor], dict[str, Any]]:
+        segment_frames = segment_frames or self.GPU_SEGMENT_FRAMES
+        try:
+            container = av.open(str(input_path), options={"hwaccel": "cuda"})
+        except av.AVError:
+            logger.warning("PyAV CUDA decode unavailable; falling back to software decode.")
+            container = av.open(str(input_path))
+
+        video_stream = container.streams.video[0]
+        fps: float
+        if video_stream.average_rate:
+            fps = float(video_stream.average_rate)
+        elif video_stream.base_rate:
+            fps = float(video_stream.base_rate)
+        else:
+            fps = 30.0
+
+        width = int(video_stream.codec_context.width or video_stream.width or 0)
+        height = int(video_stream.codec_context.height or video_stream.height or 0)
+
+        if not width or not height:
+            raise RuntimeError("Unable to determine video resolution during decode.")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        segments: list[torch.Tensor] = []
+        buffer: list[torch.Tensor] = []
+        frame_times: list[float] = []
+        frame_index = 0
+
+        try:
+            for frame in container.decode(video_stream):
+                arr = frame.to_ndarray(format="rgb24")
+                tensor = torch.from_numpy(arr).to(device=device, dtype=torch.float32)
+                tensor = tensor.permute(2, 0, 1).contiguous() / 255.0
+                if device.type == "cuda":
+                    tensor = tensor.to(dtype=torch.float16)
+                buffer.append(tensor)
+                if frame.time is not None:
+                    frame_times.append(float(frame.time))
+                else:
+                    frame_times.append(frame_index / fps)
+                frame_index += 1
+
+                if len(buffer) >= segment_frames:
+                    segments.append(torch.stack(buffer, dim=0))
+                    buffer = []
+        finally:
+            container.close()
+
+        if buffer:
+            segments.append(torch.stack(buffer, dim=0))
+
+        info = {
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "frame_times": frame_times,
+            "total_frames": len(frame_times),
+            "device": device,
+        }
+        return segments, info
+
+    @staticmethod
+    def _segments_to_cpu_frames(segments: list[torch.Tensor]) -> tuple[list[np.ndarray], list[Image.Image]]:
+        frames_rgb: list[np.ndarray] = []
+        pil_frames: list[Image.Image] = []
+        for segment in segments:
+            cpu_tensor = segment.to(device="cpu", dtype=torch.float32)
+            cpu_tensor = (cpu_tensor * 255.0).clamp(0, 255).to(torch.uint8)
+            cpu_numpy = cpu_tensor.permute(0, 2, 3, 1).contiguous().numpy()
+            for arr in cpu_numpy:
+                frames_rgb.append(arr)
+                pil_frames.append(Image.fromarray(arr, mode="RGB"))
+        return frames_rgb, pil_frames
+
+    def _encode_video_nvenc(
+        self,
+        frames: Sequence[np.ndarray],
+        width: int,
+        height: int,
+        fps: float,
+        output_path: Path,
+    ) -> None:
+        ffmpeg_bin = self._ffmpeg_path("ffmpeg")
+        encode_cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            f"{fps:.6f}",
+            "-i",
+            "-",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+
+        encode_proc = subprocess.Popen(
+            encode_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+        try:
+            if not encode_proc.stdin:
+                raise RuntimeError("Failed to open FFmpeg encode stream.")
+            for frame in frames:
+                encode_proc.stdin.write(frame.tobytes())
+        finally:
+            if encode_proc.stdin:
+                encode_proc.stdin.close()
+
+        encode_return = encode_proc.wait()
+        if encode_return != 0:
+            stderr = encode_proc.stderr.read().decode("utf-8", errors="ignore") if encode_proc.stderr else ""
+            raise RuntimeError(f"FFmpeg encode failed with code {encode_return}: {stderr}")
+        if encode_proc.stderr:
+            encode_proc.stderr.close()
+
+    def _remux_audio(self, video_path: Path, audio_path: Path | None, output_path: Path) -> None:
+        if not audio_path or not audio_path.exists() or audio_path.stat().st_size == 0:
+            shutil.move(str(video_path), str(output_path))
+            return
+
+        ffmpeg_bin = self._ffmpeg_path("ffmpeg")
+        remux_cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(video_path),
+            "-i",
+            str(audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0?",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        try:
+            subprocess.run(remux_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as exc:
+            logger.warning("Remux failed (%s); delivering video without audio.", exc)
+            shutil.move(str(video_path), str(output_path))
 
     @staticmethod
     def _ffmpeg_path(binary: str) -> str:
@@ -686,6 +894,129 @@ class WatermarkRemovalService:
 
         return detections_batch
 
+    def _detect_boxes_for_segments(
+        self,
+        segments: list[torch.Tensor],
+        detector: str | None,
+    ) -> list[list[tuple[int, int, int, int]]]:
+        backend = self._effective_detector(detector)
+        if backend != "yolo":
+            return []
+
+        self._ensure_yolo_model()
+        if self._yolo_model is None:
+            return []
+
+        device = self._yolo_device or ("cuda" if torch.cuda.is_available() else "cpu")
+        boxes_per_frame: list[list[tuple[int, int, int, int]]] = []
+        for segment in segments:
+            if segment.device.type != "cuda":
+                segment = segment.to(device=device)
+            inputs = segment.float()
+            predict_kwargs: dict[str, Any] = {
+                "verbose": False,
+                "device": device,
+                "batch": min(self.YOLO_BATCH_SIZE, inputs.shape[0]),
+            }
+            if inputs.dtype == torch.float16:
+                predict_kwargs["half"] = True
+            results = self._yolo_model.predict(inputs, **predict_kwargs)
+            names = getattr(self._yolo_model, "names", {})
+            for result in results:
+                boxes_frame: list[tuple[int, int, int, int]] = []
+                boxes = getattr(result, "boxes", None)
+                if boxes is not None and boxes.xyxy is not None:
+                    xyxy = boxes.xyxy.detach().to("cpu").numpy()
+                    for bb in xyxy:
+                        x1, y1, x2, y2 = map(int, bb[:4])
+                        boxes_frame.append((x1, y1, x2, y2))
+                boxes_per_frame.append(boxes_frame)
+
+        return boxes_per_frame
+
+    @staticmethod
+    def _box_center(box: tuple[int, int, int, int]) -> tuple[float, float]:
+        x1, y1, x2, y2 = box
+        return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+    @staticmethod
+    def _box_center_distance(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> float:
+        ax, ay = WatermarkRemovalService._box_center(box_a)
+        bx, by = WatermarkRemovalService._box_center(box_b)
+        return math.hypot(ax - bx, ay - by)
+
+    def _propagate_boxes_temporally(
+        self,
+        boxes_per_frame: list[list[tuple[int, int, int, int]]],
+        width: int,
+        height: int,
+        fps: float,
+    ) -> list[list[tuple[int, int, int, int]]]:
+        num_frames = len(boxes_per_frame)
+        propagated: list[list[tuple[int, int, int, int]]] = [list(boxes) for boxes in boxes_per_frame]
+        lookback = self.WATERMARK_LOOKBACK_FRAMES
+        lookahead = max(1, int(round(fps * self.WATERMARK_LOOKAHEAD_SECONDS)))
+        max_gap = self.WATERMARK_MAX_GAP_FRAMES
+        diag = math.hypot(width, height)
+        threshold = diag * self.WATERMARK_POSITION_THRESHOLD
+
+        for idx, boxes in enumerate(boxes_per_frame):
+            if not boxes:
+                continue
+            for box in boxes:
+                gap = 0
+                for j in range(idx - 1, max(-1, idx - lookback) - 1, -1):
+                    if j < 0:
+                        break
+                    existing = boxes_per_frame[j]
+                    if existing:
+                        min_dist = min(self._box_center_distance(box, prev_box) for prev_box in existing)
+                        if min_dist > threshold:
+                            break
+                        gap = 0
+                    else:
+                        gap += 1
+                        if gap > max_gap:
+                            break
+                    propagated[j].append(box)
+
+                gap = 0
+                for j in range(idx + 1, min(num_frames, idx + lookahead + 1)):
+                    existing = boxes_per_frame[j]
+                    if existing:
+                        min_dist = min(self._box_center_distance(box, next_box) for next_box in existing)
+                        if min_dist > threshold:
+                            break
+                        gap = 0
+                    else:
+                        gap += 1
+                        if gap > max_gap:
+                            break
+                    propagated[j].append(box)
+
+        return propagated
+
+    def _boxes_to_masks(
+        self,
+        boxes_per_frame: list[list[tuple[int, int, int, int]]],
+        width: int,
+        height: int,
+    ) -> list[np.ndarray]:
+        masks: list[np.ndarray] = []
+        for boxes in boxes_per_frame:
+            mask = Image.new("L", (width, height), 0)
+            draw = ImageDraw.Draw(mask)
+            seen: set[tuple[int, int, int, int]] = set()
+            for box in boxes:
+                key = tuple(int(v) for v in box)
+                if key in seen:
+                    continue
+                seen.add(key)
+                x1, y1, x2, y2 = key
+                draw.rectangle([x1, y1, x2, y2], fill=255)
+            masks.append(np.array(mask, dtype=np.uint8))
+        return masks
+
     def _build_mask_from_detections(
         self,
         image: Image.Image,
@@ -765,18 +1096,7 @@ class WatermarkRemovalService:
             for img in images
         ]
 
-    def _process_image_with_inpainter(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Remove watermarks from an image using the configured inpainting model.
-
-        Args:
-            image: Input image as numpy array
-            mask: Binary mask as numpy array
-
-        Returns:
-            Processed image as numpy array
-        """
-        # Older IOPaint builds rely on Pydantic v1 style validators and can break
-        # when instantiating via the regular constructor under Pydantic v2.
+    def _build_inpaint_config(self) -> Config:
         if hasattr(Config, "model_fields"):
             raw_fields = Config.model_fields
         else:  # pragma: no cover - fallback for Pydantic v1
@@ -804,17 +1124,21 @@ class WatermarkRemovalService:
         )
 
         if hasattr(Config, "model_construct"):
-            config = Config.model_construct(**config_defaults)
-        else:  # pragma: no cover - fallback for Pydantic v1
-            config = Config.construct(**config_defaults)  # type: ignore[attr-defined]
+            return Config.model_construct(**config_defaults)
+        return Config.construct(**config_defaults)  # type: ignore[attr-defined]
 
+    def _run_inpainter(self, image: np.ndarray, mask: np.ndarray, config: Config) -> np.ndarray:
         attempts: set[str] = set()
         while True:
             self._ensure_inpaint_model()
             assert self.inpaint_model_manager is not None
             model_name = self._active_inpaint_model or "unknown"
+            use_autocast = self._inpaint_device is not None and self._inpaint_device.type == "cuda"
             try:
-                result = self.inpaint_model_manager(image, mask, config)
+                with torch.inference_mode():
+                    ctx = torch.cuda.amp.autocast(enabled=use_autocast) if torch.cuda.is_available() else nullcontext()
+                    with ctx:  # type: ignore[arg-type]
+                        result = self.inpaint_model_manager(image, mask, config)
                 break
             except RuntimeError as exc:
                 device_label = self._inpaint_device.type if self._inpaint_device else "unknown"
@@ -831,8 +1155,24 @@ class WatermarkRemovalService:
 
         if result.dtype in [np.float64, np.float32]:
             result = np.clip(result, 0, 255).astype(np.uint8)
-
         return result
+
+    def _process_image_with_inpainter(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        config = self._build_inpaint_config()
+        return self._run_inpainter(image, mask, config)
+
+    def _process_frames_with_inpainter_batch(
+        self,
+        frames: list[np.ndarray],
+        masks: list[np.ndarray],
+    ) -> list[np.ndarray]:
+        outputs: list[np.ndarray] = []
+        for image, mask in zip(frames, masks):
+            config = self._build_inpaint_config()
+            result_bgr = self._run_inpainter(image, mask, config)
+            rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+            outputs.append(rgb)
+        return outputs
 
     def _make_region_transparent(self, image: Image.Image, mask: Image.Image) -> Image.Image:
         """Make watermark regions transparent.
@@ -1062,10 +1402,10 @@ class WatermarkRemovalService:
         force_format: Optional[str],
         detector: str | None,
     ) -> Path:
-        metadata = self._probe_video(input_path)
-        width = metadata["width"]
-        height = metadata["height"]
-        fps = metadata["fps"]
+        segments, info = self._decode_video_segments(input_path, self.GPU_SEGMENT_FRAMES)
+        width = info["width"]
+        height = info["height"]
+        fps = info["fps"]
 
         if force_format:
             output_format = force_format.upper()
@@ -1078,224 +1418,97 @@ class WatermarkRemovalService:
         if output_path.is_dir():
             output_file = output_path / f"{input_path.stem}_no_watermark.{output_format.lower()}"
         else:
-            output_file = output_path.with_suffix(f".{output_format.lower()}")
+            output_file = output_path.with_suffix(f".{output_format.lower()}" )
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        ffmpeg_bin = self._ffmpeg_path("ffmpeg")
+        total_frames = sum(segment.shape[0] for segment in segments)
+        if not total_frames:
+            raise RuntimeError("No frames decoded from input video.")
+
+        boxes_per_frame: list[list[tuple[int, int, int, int]]] = []
+        if detector == "yolo":
+            boxes_per_frame = self._detect_boxes_for_segments(segments, detector)
+            if boxes_per_frame and len(boxes_per_frame) != total_frames:
+                logger.warning(
+                    "YOLO produced %s boxes but video has %s frames; falling back to CPU detection.",
+                    len(boxes_per_frame),
+                    total_frames,
+                )
+                boxes_per_frame = []
+
+        frames_rgb, pil_frames = self._segments_to_cpu_frames(segments)
+        if not frames_rgb:
+            raise RuntimeError("No frames decoded from input video.")
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
-            audio_path = tmpdir_path / "audio_track.mka"
-            extract_audio_cmd = [
-                ffmpeg_bin,
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(input_path),
-                "-vn",
-                "-map",
-                "0:a?",
-                "-c:a",
-                "copy",
-                str(audio_path),
-            ]
-            try:
-                subprocess.run(
-                    extract_audio_cmd,
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+            audio_path = self._extract_audio_track(input_path, tmpdir_path)
+
+            if boxes_per_frame:
+                propagated_boxes = self._propagate_boxes_temporally(
+                    boxes_per_frame,
+                    width,
+                    height,
+                    fps,
                 )
-            except subprocess.CalledProcessError:
-                audio_path = None
+                raw_masks = self._boxes_to_masks(propagated_boxes, width, height)
+            else:
+                raw_masks = []
+                chunk_size = self.YOLO_BATCH_SIZE if (detector == "yolo") else 1
+                for idx in range(0, len(pil_frames), chunk_size):
+                    chunk_images = pil_frames[idx : idx + chunk_size]
+                    mask_images = self._generate_mask_batch(chunk_images, max_bbox_percent, detector)
+                    for mask_img in mask_images:
+                        raw_masks.append(np.array(mask_img, dtype=np.uint8))
 
-            if not audio_path or not audio_path.exists() or audio_path.stat().st_size == 0:
-                audio_path = None
+                if len(raw_masks) != len(frames_rgb):
+                    raise RuntimeError("Mismatch between decoded frames and generated masks.")
 
-            frame_size = width * height * 3
-            decode_cmd = [
-                ffmpeg_bin,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-hwaccel",
-                "cuda",
-                "-i",
-                str(input_path),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgb24",
-                "-vsync",
-                "0",
-                "-",
-            ]
+                persistence_frames = self.WATERMARK_PERSISTENCE_FRAMES
+                accumulation_frames = max(
+                    1,
+                    int(math.ceil(fps * self.WATERMARK_ACCUMULATION_SECONDS)),
+                )
+                union_masks = [mask.copy() for mask in raw_masks]
+                for i, mask in enumerate(raw_masks):
+                    if mask.max() == 0:
+                        continue
+                    start = max(0, i - persistence_frames)
+                    end = min(len(raw_masks), i + accumulation_frames)
+                    for j in range(start, end):
+                        union_masks[j] = np.maximum(union_masks[j], mask)
 
-            decode_proc = subprocess.Popen(
-                decode_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
+                raw_masks = union_masks
 
-            frames_rgb: list[np.ndarray] = []
-            pil_frames: list[Image.Image] = []
+            refined_masks = [self._refine_mask(mask) for mask in raw_masks]
 
-            if not decode_proc.stdout:
-                raise RuntimeError("Failed to open ffmpeg decode stream.")
-
-            while True:
-                frame_bytes = decode_proc.stdout.read(frame_size)
-                if not frame_bytes or len(frame_bytes) < frame_size:
-                    break
-                frame_np = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3)).copy()
-                frames_rgb.append(frame_np)
-                pil_frames.append(Image.fromarray(frame_np, mode="RGB"))
-
-            decode_proc.stdout.close()
-            decode_return = decode_proc.wait()
-            if decode_return != 0:
-                stderr = decode_proc.stderr.read().decode("utf-8", errors="ignore") if decode_proc.stderr else ""
-                raise RuntimeError(f"FFmpeg decode failed with code {decode_return}: {stderr}")
-            if decode_proc.stderr:
-                decode_proc.stderr.close()
-
-            if not frames_rgb:
-                raise RuntimeError("No frames decoded from input video.")
-
-            raw_masks: list[np.ndarray] = []
-            chunk_size = self.YOLO_BATCH_SIZE if (detector == "yolo") else 1
-            for idx in range(0, len(pil_frames), chunk_size):
-                chunk_images = pil_frames[idx : idx + chunk_size]
-                mask_images = self._generate_mask_batch(chunk_images, max_bbox_percent, detector)
-                for mask_img in mask_images:
-                    raw_masks.append(np.array(mask_img, dtype=np.uint8))
-
-            if len(raw_masks) != len(frames_rgb):
-                raise RuntimeError("Mismatch between decoded frames and generated masks.")
-
-            union_masks: list[np.ndarray] = [mask.copy() for mask in raw_masks]
-            persistence_frames = self.WATERMARK_PERSISTENCE_FRAMES
-            accumulation_frames = max(
-                1,
-                int(math.ceil(fps * self.WATERMARK_ACCUMULATION_SECONDS)),
-            )
-
-            for i, mask in enumerate(raw_masks):
-                if mask.max() == 0:
-                    continue
-                start = max(0, i - persistence_frames)
-                end = min(len(raw_masks), i + accumulation_frames)
-                for j in range(start, end):
-                    union_masks[j] = np.maximum(union_masks[j], mask)
-
-            refined_masks = [self._refine_mask(mask) for mask in union_masks]
-
-            processed_frames: list[np.ndarray] = []
-            for frame_np, pil_image, mask_np in zip(frames_rgb, pil_frames, refined_masks):
-                if mask_np.max() == 0:
-                    processed_frames.append(frame_np)
-                    continue
-
-                mask_image = Image.fromarray(mask_np, mode="L")
-                if transparent:
+            if transparent:
+                processed_frames: list[np.ndarray] = []
+                for frame_np, mask_np in zip(frames_rgb, refined_masks):
+                    if mask_np.max() == 0:
+                        processed_frames.append(frame_np)
+                        continue
+                    mask_image = Image.fromarray(mask_np, mode="L")
+                    pil_image = Image.fromarray(frame_np, mode="RGB")
                     result_image = self._make_region_transparent(pil_image, mask_image)
                     background = Image.new("RGB", result_image.size, (255, 255, 255))
                     background.paste(result_image, mask=result_image.split()[3])
                     processed_frames.append(np.array(background, dtype=np.uint8))
-                else:
-                    inpaint_result = self._process_image_with_inpainter(
-                        np.array(pil_image), mask_np
-                    )
-                    processed_frames.append(cv2.cvtColor(inpaint_result, cv2.COLOR_BGR2RGB))
+            else:
+                processed_frames = frames_rgb.copy()
+                indices: list[int] = [idx for idx, mask_np in enumerate(refined_masks) if mask_np.max() > 0]
+                if indices:
+                    for start in range(0, len(indices), self.INPAINT_BATCH_SIZE):
+                        batch_indices = indices[start : start + self.INPAINT_BATCH_SIZE]
+                        batch_frames = [frames_rgb[i] for i in batch_indices]
+                        batch_masks = [refined_masks[i] for i in batch_indices]
+                        inpainted_batch = self._process_frames_with_inpainter_batch(batch_frames, batch_masks)
+                        for idx_local, processed in zip(batch_indices, inpainted_batch):
+                            processed_frames[idx_local] = processed
 
             video_tmp_path = tmpdir_path / "video_no_audio.mp4"
-            encode_cmd = [
-                ffmpeg_bin,
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgb24",
-                "-s",
-                f"{width}x{height}",
-                "-r",
-                f"{fps:.6f}",
-                "-i",
-                "-",
-                "-c:v",
-                "h264_nvenc",
-                "-preset",
-                "p4",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                str(video_tmp_path),
-            ]
-
-            encode_proc = subprocess.Popen(
-                encode_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-
-            if not encode_proc.stdin:
-                raise RuntimeError("Failed to open ffmpeg encode stream.")
-
-            for frame in processed_frames:
-                encode_proc.stdin.write(frame.tobytes())
-
-            encode_proc.stdin.close()
-            encode_return = encode_proc.wait()
-            if encode_return != 0:
-                stderr = encode_proc.stderr.read().decode("utf-8", errors="ignore") if encode_proc.stderr else ""
-                raise RuntimeError(f"FFmpeg encode failed with code {encode_return}: {stderr}")
-            if encode_proc.stderr:
-                encode_proc.stderr.close()
-
-            if audio_path:
-                remux_cmd = [
-                    ffmpeg_bin,
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    str(video_tmp_path),
-                    "-i",
-                    str(audio_path),
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "1:a:0?",
-                    "-c:v",
-                    "copy",
-                    "-c:a",
-                    "copy",
-                    "-movflags",
-                    "+faststart",
-                    str(output_file),
-                ]
-                try:
-                    subprocess.run(
-                        remux_cmd,
-                        check=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
-                except subprocess.CalledProcessError as exc:
-                    logger.warning(
-                        "Audio remux failed (%s); keeping video without audio.",
-                        exc,
-                    )
-                    shutil.move(str(video_tmp_path), str(output_file))
-            else:
-                shutil.move(str(video_tmp_path), str(output_file))
+            self._encode_video_nvenc(processed_frames, width, height, fps, video_tmp_path)
+            self._remux_audio(video_tmp_path, audio_path, output_file)
 
         logger.info("GPU offline pipeline completed successfully: %s -> %s", input_path, output_file)
         return output_file
