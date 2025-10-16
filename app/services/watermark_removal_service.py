@@ -15,6 +15,18 @@ import numpy as np
 import torch
 from loguru import logger
 from PIL import Image, ImageDraw, UnidentifiedImageError
+try:
+    from pydantic_core import PydanticUndefined
+except ImportError:  # pragma: no cover - compatibility for Pydantic v1
+    class _Undefined:  # type: ignore
+        pass
+
+    PydanticUndefined = _Undefined()  # type: ignore
+
+try:  # pragma: no cover - compatibility shim
+    from pydantic.fields import Undefined  # type: ignore
+except ImportError:  # pragma: no cover
+    Undefined = PydanticUndefined  # type: ignore
 from transformers import AutoProcessor, AutoModelForCausalLM
 from iopaint.model.lama import LaMa
 from iopaint.model.zits import ZITS
@@ -264,14 +276,38 @@ class WatermarkRemovalService:
         Returns:
             Processed image as numpy array
         """
-        config = Config(
-            ldm_steps=50,
-            ldm_sampler=LDMSampler.ddim,
-            hd_strategy=HDStrategy.CROP,
-            hd_strategy_crop_margin=64,
-            hd_strategy_crop_trigger_size=800,
-            hd_strategy_resize_limit=1600,
+        # Older IOPaint builds rely on Pydantic v1 style validators and can break
+        # when instantiating via the regular constructor under Pydantic v2.
+        if hasattr(Config, "model_fields"):
+            raw_fields = Config.model_fields
+        else:  # pragma: no cover - fallback for Pydantic v1
+            raw_fields = getattr(Config, "__fields__", {})
+
+        undefined_sentinels = {PydanticUndefined, Undefined}
+        config_defaults: dict[str, object] = {}
+        for name, field in raw_fields.items():
+            default = getattr(field, "default", PydanticUndefined)
+            default_factory = getattr(field, "default_factory", None)
+            if default not in undefined_sentinels:
+                config_defaults[name] = default
+            elif callable(default_factory):
+                config_defaults[name] = default_factory()
+
+        config_defaults.update(
+            {
+                "ldm_steps": 50,
+                "ldm_sampler": LDMSampler.ddim,
+                "hd_strategy": HDStrategy.CROP,
+                "hd_strategy_crop_margin": 64,
+                "hd_strategy_crop_trigger_size": 800,
+                "hd_strategy_resize_limit": 1600,
+            }
         )
+
+        if hasattr(Config, "model_construct"):
+            config = Config.model_construct(**config_defaults)
+        else:  # pragma: no cover - fallback for Pydantic v1
+            config = Config.construct(**config_defaults)  # type: ignore[attr-defined]
 
         attempts: set[str] = set()
         while True:

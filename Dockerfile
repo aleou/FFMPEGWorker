@@ -9,7 +9,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_PREFER_BINARY=1 \
     CMAKE_BUILD_PARALLEL_LEVEL=8 \
-    HF_HOME=/opt/hf-cache
+    HF_HOME=/opt/hf-cache \
+    TORCH_HOME=/root/.cache/torch
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -71,6 +72,7 @@ COPY --from=models /opt/hf-cache /opt/hf-cache
 COPY --from=models /root/.cache/torch /root/.cache/torch
 
 ENV HF_HOME=/opt/hf-cache \
+    TORCH_HOME=/root/.cache/torch \
     PATH="/workspace/.local/bin:${PATH}"
 
 WORKDIR /workspace
@@ -88,6 +90,7 @@ COPY --from=models /opt/hf-cache /opt/hf-cache
 COPY --from=models /root/.cache/torch /root/.cache/torch
 
 ENV HF_HOME=/opt/hf-cache \
+    TORCH_HOME=/root/.cache/torch \
     PATH="/workspace/.local/bin:${PATH}"
 
 WORKDIR /workspace
