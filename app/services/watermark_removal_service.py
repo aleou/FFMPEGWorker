@@ -1066,7 +1066,6 @@ class WatermarkRemovalService:
         width = metadata["width"]
         height = metadata["height"]
         fps = metadata["fps"]
-        total_frames = metadata["frames"] or 0
 
         if force_format:
             output_format = force_format.upper()
@@ -1083,67 +1082,161 @@ class WatermarkRemovalService:
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
         ffmpeg_bin = self._ffmpeg_path("ffmpeg")
-        frame_size = width * height * 3
-        decode_cmd = [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-hwaccel",
-            "cuda",
-            "-i",
-            str(input_path),
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-vsync",
-            "0",
-            "-",
-        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            audio_path = tmpdir_path / "audio_track.mka"
+            extract_audio_cmd = [
+                ffmpeg_bin,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(input_path),
+                "-vn",
+                "-map",
+                "0:a?",
+                "-c:a",
+                "copy",
+                str(audio_path),
+            ]
+            try:
+                subprocess.run(
+                    extract_audio_cmd,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            except subprocess.CalledProcessError:
+                audio_path = None
 
-        encode_cmd = [
-            ffmpeg_bin,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s",
-            f"{width}x{height}",
-            "-r",
-            f"{fps:.6f}",
-            "-i",
-            "-",
-            "-i",
-            str(input_path),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a?",
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p4",
-            "-movflags",
-            "+faststart",
-            "-shortest",
-            "-c:a",
-            "copy",
-            str(output_file),
-        ]
+            if not audio_path or not audio_path.exists() or audio_path.stat().st_size == 0:
+                audio_path = None
 
-        decode_proc = None
-        encode_proc = None
-        try:
+            frame_size = width * height * 3
+            decode_cmd = [
+                ffmpeg_bin,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-hwaccel",
+                "cuda",
+                "-i",
+                str(input_path),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-vsync",
+                "0",
+                "-",
+            ]
+
             decode_proc = subprocess.Popen(
                 decode_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
+
+            frames_rgb: list[np.ndarray] = []
+            pil_frames: list[Image.Image] = []
+
+            if not decode_proc.stdout:
+                raise RuntimeError("Failed to open ffmpeg decode stream.")
+
+            while True:
+                frame_bytes = decode_proc.stdout.read(frame_size)
+                if not frame_bytes or len(frame_bytes) < frame_size:
+                    break
+                frame_np = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3)).copy()
+                frames_rgb.append(frame_np)
+                pil_frames.append(Image.fromarray(frame_np, mode="RGB"))
+
+            decode_proc.stdout.close()
+            decode_return = decode_proc.wait()
+            if decode_return != 0:
+                stderr = decode_proc.stderr.read().decode("utf-8", errors="ignore") if decode_proc.stderr else ""
+                raise RuntimeError(f"FFmpeg decode failed with code {decode_return}: {stderr}")
+            if decode_proc.stderr:
+                decode_proc.stderr.close()
+
+            if not frames_rgb:
+                raise RuntimeError("No frames decoded from input video.")
+
+            raw_masks: list[np.ndarray] = []
+            chunk_size = self.YOLO_BATCH_SIZE if (detector == "yolo") else 1
+            for idx in range(0, len(pil_frames), chunk_size):
+                chunk_images = pil_frames[idx : idx + chunk_size]
+                mask_images = self._generate_mask_batch(chunk_images, max_bbox_percent, detector)
+                for mask_img in mask_images:
+                    raw_masks.append(np.array(mask_img, dtype=np.uint8))
+
+            if len(raw_masks) != len(frames_rgb):
+                raise RuntimeError("Mismatch between decoded frames and generated masks.")
+
+            union_masks: list[np.ndarray] = [mask.copy() for mask in raw_masks]
+            persistence_frames = self.WATERMARK_PERSISTENCE_FRAMES
+            accumulation_frames = max(
+                1,
+                int(math.ceil(fps * self.WATERMARK_ACCUMULATION_SECONDS)),
+            )
+
+            for i, mask in enumerate(raw_masks):
+                if mask.max() == 0:
+                    continue
+                start = max(0, i - persistence_frames)
+                end = min(len(raw_masks), i + accumulation_frames)
+                for j in range(start, end):
+                    union_masks[j] = np.maximum(union_masks[j], mask)
+
+            refined_masks = [self._refine_mask(mask) for mask in union_masks]
+
+            processed_frames: list[np.ndarray] = []
+            for frame_np, pil_image, mask_np in zip(frames_rgb, pil_frames, refined_masks):
+                if mask_np.max() == 0:
+                    processed_frames.append(frame_np)
+                    continue
+
+                mask_image = Image.fromarray(mask_np, mode="L")
+                if transparent:
+                    result_image = self._make_region_transparent(pil_image, mask_image)
+                    background = Image.new("RGB", result_image.size, (255, 255, 255))
+                    background.paste(result_image, mask=result_image.split()[3])
+                    processed_frames.append(np.array(background, dtype=np.uint8))
+                else:
+                    inpaint_result = self._process_image_with_inpainter(
+                        np.array(pil_image), mask_np
+                    )
+                    processed_frames.append(cv2.cvtColor(inpaint_result, cv2.COLOR_BGR2RGB))
+
+            video_tmp_path = tmpdir_path / "video_no_audio.mp4"
+            encode_cmd = [
+                ffmpeg_bin,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                f"{width}x{height}",
+                "-r",
+                f"{fps:.6f}",
+                "-i",
+                "-",
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p4",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(video_tmp_path),
+            ]
+
             encode_proc = subprocess.Popen(
                 encode_cmd,
                 stdin=subprocess.PIPE,
@@ -1151,147 +1244,60 @@ class WatermarkRemovalService:
                 stderr=subprocess.PIPE,
             )
 
-            if not decode_proc.stdout or not encode_proc.stdin:
-                raise RuntimeError("Unable to open FFmpeg pipelines for processing.")
+            if not encode_proc.stdin:
+                raise RuntimeError("Failed to open ffmpeg encode stream.")
 
-            use_yolo = detector == "yolo"
-            batch_size = self.YOLO_BATCH_SIZE if use_yolo else 1
-            history_limit = max(
-                1,
-                int(
-                    math.ceil(
-                        (fps * self.WATERMARK_ACCUMULATION_SECONDS)
-                        / float(max(1, batch_size))
-                    )
-                ),
-            )
-            mask_history: deque[np.ndarray] = deque(maxlen=history_limit)
-            frame_buffer: deque[tuple[np.ndarray, Image.Image]] = deque()
-            pending_masks: deque[np.ndarray] = deque()
-
-            def _union_mask(history: deque[np.ndarray]) -> np.ndarray:
-                if not history:
-                    return np.zeros((height, width), dtype=np.uint8)
-                mask_stack = np.stack(history, axis=0)
-                return mask_stack.max(axis=0).astype(np.uint8)
-
-            def _update_history(raw_mask: np.ndarray) -> np.ndarray:
-                mask_history.append(raw_mask)
-                return _union_mask(mask_history)
-
-            def flush_batches(force: bool = False) -> None:
-                if use_yolo:
-                    while len(frame_buffer) >= batch_size or (force and frame_buffer):
-                        chunk_size = batch_size if len(frame_buffer) >= batch_size else len(frame_buffer)
-                        chunk_images = [frame_buffer[i][1] for i in range(chunk_size)]
-                        mask_images = self._generate_mask_batch(chunk_images, max_bbox_percent, detector)
-                        for mask_img in mask_images:
-                            raw_np = np.array(mask_img, dtype=np.uint8)
-                            combined_np = _update_history(raw_np)
-                            pending_masks.append(combined_np)
-                        if not force:
-                            break
-                        if len(frame_buffer) == 0:
-                            break
-                else:
-                    while frame_buffer and (force or not pending_masks):
-                        image = frame_buffer[0][1]
-                        mask_images = self._generate_mask_batch([image], max_bbox_percent, detector)
-                        raw_np = np.array(mask_images[0], dtype=np.uint8)
-                        combined_np = _update_history(raw_np)
-                        pending_masks.append(combined_np)
-                        if not force:
-                            break
-
-            frame_count = 0
-            with tqdm.tqdm(total=total_frames or None, desc="Processing video frames") as pbar:
-                while True:
-                    frame_bytes = decode_proc.stdout.read(frame_size)
-                    if not frame_bytes or len(frame_bytes) < frame_size:
-                        break
-
-                    frame_np = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3))
-                    pil_image = Image.fromarray(frame_np, mode="RGB")
-                    frame_buffer.append((frame_np, pil_image))
-
-                    flush_batches(force=False)
-
-                    while pending_masks and frame_buffer:
-                        combined_np = pending_masks.popleft()
-                        frame_np_proc, pil_image_proc = frame_buffer.popleft()
-                        mask_image = Image.fromarray(combined_np, mode="L")
-                        mask_np = combined_np
-
-                        if transparent:
-                            result_image = self._make_region_transparent(pil_image_proc, mask_image)
-                            background = Image.new("RGB", result_image.size, (255, 255, 255))
-                            background.paste(result_image, mask=result_image.split()[3])
-                            result_image = background
-                            out_frame = np.array(result_image.convert("RGB"), dtype=np.uint8)
-                        else:
-                            inpaint_result = self._process_image_with_inpainter(
-                                np.array(pil_image_proc), mask_np
-                            )
-                            out_frame = cv2.cvtColor(inpaint_result, cv2.COLOR_BGR2RGB)
-
-                        encode_proc.stdin.write(out_frame.tobytes())
-                        frame_count += 1
-                        pbar.update(1)
-
-                flush_batches(force=True)
-                while pending_masks and frame_buffer:
-                    combined_np = pending_masks.popleft()
-                    _, pil_image_proc = frame_buffer.popleft()
-                    mask_image = Image.fromarray(combined_np, mode="L")
-                    mask_np = combined_np
-
-                    if transparent:
-                        result_image = self._make_region_transparent(pil_image_proc, mask_image)
-                        background = Image.new("RGB", result_image.size, (255, 255, 255))
-                        background.paste(result_image, mask=result_image.split()[3])
-                        result_image = background
-                        out_frame = np.array(result_image.convert("RGB"), dtype=np.uint8)
-                    else:
-                        inpaint_result = self._process_image_with_inpainter(
-                            np.array(pil_image_proc), mask_np
-                        )
-                        out_frame = cv2.cvtColor(inpaint_result, cv2.COLOR_BGR2RGB)
-
-                    encode_proc.stdin.write(out_frame.tobytes())
-                    frame_count += 1
-                    pbar.update(1)
+            for frame in processed_frames:
+                encode_proc.stdin.write(frame.tobytes())
 
             encode_proc.stdin.close()
-            decode_return = decode_proc.wait()
-            if decode_return != 0:
-                stderr = decode_proc.stderr.read().decode("utf-8", errors="ignore") if decode_proc.stderr else ""
-                raise RuntimeError(f"FFmpeg decode pipeline failed with code {decode_return}: {stderr}")
-
             encode_return = encode_proc.wait()
             if encode_return != 0:
                 stderr = encode_proc.stderr.read().decode("utf-8", errors="ignore") if encode_proc.stderr else ""
-                raise RuntimeError(f"FFmpeg encode pipeline failed with code {encode_return}: {stderr}")
-
-        except Exception:
-            if encode_proc and encode_proc.poll() is None:
-                encode_proc.kill()
-            if decode_proc and decode_proc.poll() is None:
-                decode_proc.kill()
-            raise
-        finally:
-            if decode_proc and decode_proc.stdout:
-                decode_proc.stdout.close()
-            if decode_proc and decode_proc.stderr:
-                decode_proc.stderr.close()
-            if encode_proc and encode_proc.stdin:
-                try:
-                    encode_proc.stdin.close()
-                except Exception:  # pragma: no cover - cleanup
-                    pass
-            if encode_proc and encode_proc.stderr:
+                raise RuntimeError(f"FFmpeg encode failed with code {encode_return}: {stderr}")
+            if encode_proc.stderr:
                 encode_proc.stderr.close()
 
-        logger.info("GPU pipeline completed successfully: %s -> %s", input_path, output_file)
+            if audio_path:
+                remux_cmd = [
+                    ffmpeg_bin,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(video_tmp_path),
+                    "-i",
+                    str(audio_path),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0?",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    str(output_file),
+                ]
+                try:
+                    subprocess.run(
+                        remux_cmd,
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                except subprocess.CalledProcessError as exc:
+                    logger.warning(
+                        "Audio remux failed (%s); keeping video without audio.",
+                        exc,
+                    )
+                    shutil.move(str(video_tmp_path), str(output_file))
+            else:
+                shutil.move(str(video_tmp_path), str(output_file))
+
+        logger.info("GPU offline pipeline completed successfully: %s -> %s", input_path, output_file)
         return output_file
 
     def _process_video(
