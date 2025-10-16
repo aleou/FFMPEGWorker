@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import json
+import math
+import shutil
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 from urllib.parse import urlparse
 from enum import Enum
 
@@ -271,6 +274,95 @@ class WatermarkRemovalService:
             "microsoft/Florence-2-large", trust_remote_code=True
         )
         logger.info("Florence-2 model loaded")
+
+    def _probe_video(self, input_path: Path) -> dict[str, Any]:
+        probe_cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            str(input_path),
+        ]
+        try:
+            result = subprocess.run(
+                probe_cmd,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError as exc:  # pragma: no cover - external dependency
+            raise RuntimeError(f"Failed to probe video metadata: {exc.stderr.decode().strip()}") from exc
+
+        try:
+            payload = json.loads(result.stdout.decode("utf-8"))
+        except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+            raise RuntimeError("Unable to parse ffprobe output") from exc
+
+        streams = payload.get("streams") or []
+        if not streams:
+            raise RuntimeError("No video stream found in source file.")
+
+        stream = streams[0]
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        if not width or not height:
+            raise RuntimeError("Unable to determine video resolution.")
+
+        def _frame_rate(entry: str | None) -> float | None:
+            if not entry or entry == "0/0":
+                return None
+            if "/" in entry:
+                num, den = entry.split("/", 1)
+                try:
+                    return float(num) / float(den)
+                except (ValueError, ZeroDivisionError):
+                    return None
+            try:
+                return float(entry)
+            except ValueError:
+                return None
+
+        avg_rate = _frame_rate(stream.get("avg_frame_rate"))
+        r_rate = _frame_rate(stream.get("r_frame_rate"))
+        fps = avg_rate or r_rate or 30.0
+
+        nb_frames_raw = stream.get("nb_frames")
+        total_frames: int | None = None
+        if nb_frames_raw and nb_frames_raw.isdigit():
+            total_frames = int(nb_frames_raw)
+
+        duration = None
+        if total_frames is None:
+            duration_value = payload.get("format", {}).get("duration")
+            try:
+                duration = float(duration_value) if duration_value is not None else None
+            except (TypeError, ValueError):
+                duration = None
+            if duration:
+                total_frames = int(math.ceil(duration * fps))
+
+        if total_frames is None:
+            total_frames = 0
+
+        return {
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "frames": total_frames,
+            "duration": duration,
+        }
+
+    @staticmethod
+    def _ffmpeg_path(binary: str) -> str:
+        resolved = shutil.which(binary)
+        return resolved or binary
 
     def _load_models(self):
         """Load the AI models if not already loaded."""
@@ -662,7 +754,7 @@ class WatermarkRemovalService:
         video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm']
         return file_path.suffix.lower() in video_extensions
 
-    def _process_video(
+    def _process_video_cpu(
         self,
         input_path: Path,
         output_path: Path,
@@ -832,6 +924,214 @@ class WatermarkRemovalService:
                 pass
 
         return output_file
+
+    def _process_video_gpu(
+        self,
+        input_path: Path,
+        output_path: Path,
+        transparent: bool,
+        max_bbox_percent: float,
+        force_format: Optional[str],
+        detector: str | None,
+    ) -> Path:
+        metadata = self._probe_video(input_path)
+        width = metadata["width"]
+        height = metadata["height"]
+        fps = metadata["fps"]
+        total_frames = metadata["frames"] or 0
+
+        if force_format:
+            output_format = force_format.upper()
+        else:
+            output_format = "MP4"
+
+        if output_format not in {"MP4", "M4V", "MOV"}:
+            raise RuntimeError(f"GPU pipeline currently supports MP4/MOV outputs, not {output_format}.")
+
+        if output_path.is_dir():
+            output_file = output_path / f"{input_path.stem}_no_watermark.{output_format.lower()}"
+        else:
+            output_file = output_path.with_suffix(f".{output_format.lower()}")
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        ffmpeg_bin = self._ffmpeg_path("ffmpeg")
+        frame_size = width * height * 3
+        decode_cmd = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-hwaccel",
+            "cuda",
+            "-i",
+            str(input_path),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-vsync",
+            "0",
+            "-",
+        ]
+
+        encode_cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            f"{fps:.6f}",
+            "-i",
+            "-",
+            "-i",
+            str(input_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a?",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-movflags",
+            "+faststart",
+            "-shortest",
+            "-c:a",
+            "copy",
+            str(output_file),
+        ]
+
+        decode_proc = None
+        encode_proc = None
+        try:
+            decode_proc = subprocess.Popen(
+                decode_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            encode_proc = subprocess.Popen(
+                encode_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+
+            if not decode_proc.stdout or not encode_proc.stdin:
+                raise RuntimeError("Unable to open FFmpeg pipelines for processing.")
+
+            detection_interval = max(1, int(round(fps)) or 1)
+            mask_image_cached: Image.Image | None = None
+            combined_mask_array: np.ndarray | None = None
+
+            frame_count = 0
+            with tqdm.tqdm(total=total_frames or None, desc="Processing video frames") as pbar:
+                while True:
+                    frame_bytes = decode_proc.stdout.read(frame_size)
+                    if not frame_bytes or len(frame_bytes) < frame_size:
+                        break
+
+                    frame_np = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3))
+                    pil_image = Image.fromarray(frame_np, mode="RGB")
+
+                    refresh_mask = mask_image_cached is None or frame_count % detection_interval == 0
+                    if refresh_mask:
+                        mask_image_cached = self._get_watermark_mask(pil_image, max_bbox_percent, detector)
+                        combined_mask_array = np.array(mask_image_cached, dtype=np.uint8)
+                    elif combined_mask_array is None:
+                        combined_mask_array = np.zeros((height, width), dtype=np.uint8)
+                        mask_image_cached = Image.fromarray(combined_mask_array, mode="L")
+
+                    mask_np = combined_mask_array if combined_mask_array is not None else np.zeros(
+                        (height, width), dtype=np.uint8
+                    )
+                    mask_image = mask_image_cached if mask_image_cached is not None else Image.fromarray(
+                        mask_np, mode="L"
+                    )
+
+                    if transparent:
+                        result_image = self._make_region_transparent(pil_image, mask_image)
+                        background = Image.new("RGB", result_image.size, (255, 255, 255))
+                        background.paste(result_image, mask=result_image.split()[3])
+                        result_image = background
+                        out_frame = np.array(result_image.convert("RGB"), dtype=np.uint8)
+                    else:
+                        inpaint_result = self._process_image_with_inpainter(
+                            np.array(pil_image), mask_np
+                        )
+                        out_frame = cv2.cvtColor(inpaint_result, cv2.COLOR_BGR2RGB)
+
+                    encode_proc.stdin.write(out_frame.tobytes())
+                    frame_count += 1
+                    pbar.update(1)
+
+            encode_proc.stdin.close()
+            decode_return = decode_proc.wait()
+            if decode_return != 0:
+                stderr = decode_proc.stderr.read().decode("utf-8", errors="ignore") if decode_proc.stderr else ""
+                raise RuntimeError(f"FFmpeg decode pipeline failed with code {decode_return}: {stderr}")
+
+            encode_return = encode_proc.wait()
+            if encode_return != 0:
+                stderr = encode_proc.stderr.read().decode("utf-8", errors="ignore") if encode_proc.stderr else ""
+                raise RuntimeError(f"FFmpeg encode pipeline failed with code {encode_return}: {stderr}")
+
+        except Exception:
+            if encode_proc and encode_proc.poll() is None:
+                encode_proc.kill()
+            if decode_proc and decode_proc.poll() is None:
+                decode_proc.kill()
+            raise
+        finally:
+            if decode_proc and decode_proc.stdout:
+                decode_proc.stdout.close()
+            if decode_proc and decode_proc.stderr:
+                decode_proc.stderr.close()
+            if encode_proc and encode_proc.stdin:
+                try:
+                    encode_proc.stdin.close()
+                except Exception:  # pragma: no cover - cleanup
+                    pass
+            if encode_proc and encode_proc.stderr:
+                encode_proc.stderr.close()
+
+        logger.info("GPU pipeline completed successfully: %s -> %s", input_path, output_file)
+        return output_file
+
+    def _process_video(
+        self,
+        input_path: Path,
+        output_path: Path,
+        transparent: bool,
+        max_bbox_percent: float,
+        force_format: Optional[str],
+        detector: str | None,
+    ) -> Path:
+        try:
+            return self._process_video_gpu(
+                input_path=input_path,
+                output_path=output_path,
+                transparent=transparent,
+                max_bbox_percent=max_bbox_percent,
+                force_format=force_format,
+                detector=detector,
+            )
+        except Exception as exc:
+            logger.error("GPU video pipeline failed (%s). Falling back to CPU implementation.", exc, exc_info=True)
+            return self._process_video_cpu(
+                input_path=input_path,
+                output_path=output_path,
+                transparent=transparent,
+                max_bbox_percent=max_bbox_percent,
+                force_format=force_format,
+                detector=detector,
+            )
 
     def process_file(
         self,
