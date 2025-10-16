@@ -569,13 +569,7 @@ class WatermarkRemovalService:
         encode_return = encode_proc.wait()
         if encode_return != 0:
             stderr = encode_proc.stderr.read().decode("utf-8", errors="ignore") if encode_proc.stderr else ""
-            
-            # If NVENC failed, try CPU fallback with libx264
-            if "h264_nvenc" in stderr or "nvenc" in stderr.lower():
-                logger.warning("NVENC not available, falling back to CPU encoding (libx264)")
-                self._encode_video_cpu(frames, width, height, fps, output_path)
-            else:
-                raise RuntimeError(f"FFmpeg encode failed with code {encode_return}: {stderr}")
+            raise RuntimeError(f"NVENC encoding failed (code {encode_return}): {stderr}")
         if encode_proc.stderr:
             encode_proc.stderr.close()
     
@@ -1634,7 +1628,17 @@ class WatermarkRemovalService:
                             processed_frames[idx_local] = processed
 
             video_tmp_path = tmpdir_path / "video_no_audio.mp4"
-            self._encode_video_nvenc(processed_frames, width, height, fps, video_tmp_path)
+            
+            # Try hardware encoding first, fallback to CPU if it fails
+            try:
+                logger.info("Attempting NVENC hardware encoding...")
+                self._encode_video_nvenc(processed_frames, width, height, fps, video_tmp_path)
+                logger.info("NVENC encoding successful")
+            except Exception as nvenc_error:
+                logger.warning("NVENC encoding failed (%s), falling back to CPU libx264 encoding", nvenc_error)
+                self._encode_video_cpu(processed_frames, width, height, fps, video_tmp_path)
+                logger.info("CPU encoding successful")
+            
             self._remux_audio(video_tmp_path, audio_path, output_file)
 
         logger.info("GPU offline pipeline completed successfully: %s -> %s", input_path, output_file)
@@ -1650,6 +1654,7 @@ class WatermarkRemovalService:
         detector: str | None,
     ) -> Path:
         try:
+            logger.info("Attempting GPU video pipeline...")
             return self._process_video_gpu(
                 input_path=input_path,
                 output_path=output_path,
@@ -1659,7 +1664,7 @@ class WatermarkRemovalService:
                 detector=detector,
             )
         except Exception as exc:
-            logger.error("GPU video pipeline failed (%s). Falling back to CPU implementation.", exc, exc_info=True)
+            logger.error("GPU video pipeline failed with error: %s (type: %s). Falling back to CPU implementation.", str(exc), type(exc).__name__, exc_info=True)
             return self._process_video_cpu(
                 input_path=input_path,
                 output_path=output_path,

@@ -91,7 +91,10 @@ COPY --from=models /root/.cache/torch /root/.cache/torch
 
 ENV HF_HOME=/opt/hf-cache \
     TORCH_HOME=/root/.cache/torch \
-    PATH="/workspace/.local/bin:${PATH}"
+    PATH="/workspace/.local/bin:${PATH}" \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    RUNPOD_SKIP_GPU_DETECTION=1
 
 WORKDIR /workspace
 
