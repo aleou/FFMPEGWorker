@@ -7,7 +7,7 @@ variable "IMAGE" {
 }
 
 variable "RELEASE_VERSION" {
-  default = "0.10.0"
+  default = "0.11.0"
 }
 
 group "default" {

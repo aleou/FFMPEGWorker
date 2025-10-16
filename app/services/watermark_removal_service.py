@@ -8,6 +8,7 @@ import tempfile
 import json
 import math
 import shutil
+from collections import deque
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Optional, Any
@@ -64,7 +65,14 @@ class WatermarkRemovalService:
         "channel",
         "branding",
         "corner text",
+        "channel id",
+        "watermark logo",
+        "station id",
+        "broadcast bug",
+        "on screen graphic",
         "sora logo",
+        "powered by",
+        "copyright",
     )
     WATERMARK_NEGATIVE_KEYWORDS = (
         "traffic",
@@ -80,7 +88,13 @@ class WatermarkRemovalService:
         "bike",
         "pedestrian",
     )
-    WATERMARK_MIN_SCORE = 0.18
+    WATERMARK_MIN_SCORE = 0.12
+    WATERMARK_FALLBACK_MIN_SCORE = 0.08
+    WATERMARK_DILATION_KERNEL = (5, 5)
+    WATERMARK_DILATION_ITERATIONS = 2
+    WATERMARK_PERSISTENCE_FRAMES = 12  # keep detections alive for ~0.5s @24fps
+    WATERMARK_ACCUMULATION_SECONDS = 1.5
+    YOLO_BATCH_SIZE = 4
 
     def __init__(
         self,
@@ -434,9 +448,6 @@ class WatermarkRemovalService:
         height: int,
         max_bbox_percent: float,
     ) -> bool:
-        if score is not None and score < self.WATERMARK_MIN_SCORE:
-            return False
-
         bbox_area = self._box_area(bbox)
         if bbox_area == 0:
             return False
@@ -448,6 +459,14 @@ class WatermarkRemovalService:
         label_normalized = (label or "").lower().strip()
         if label_normalized:
             if any(term in label_normalized for term in self.WATERMARK_NEGATIVE_KEYWORDS):
+                return False
+
+        if score is not None and score < self.WATERMARK_MIN_SCORE:
+            allow_soft_match = (
+                label_normalized
+                and any(key in label_normalized for key in self.WATERMARK_POSITIVE_KEYWORDS)
+            ) or self._is_near_border(bbox, width, height)
+            if not allow_soft_match or score < self.WATERMARK_FALLBACK_MIN_SCORE:
                 return False
 
         is_edge_candidate = self._is_near_border(bbox, width, height)
@@ -472,8 +491,8 @@ class WatermarkRemovalService:
     def _refine_mask(self, mask: np.ndarray) -> np.ndarray:
         if mask.size == 0 or mask.max() == 0:
             return mask
-        kernel = np.ones((3, 3), np.uint8)
-        dilated = cv2.dilate(mask, kernel, iterations=1)
+        kernel = np.ones(self.WATERMARK_DILATION_KERNEL, np.uint8)
+        dilated = cv2.dilate(mask, kernel, iterations=self.WATERMARK_DILATION_ITERATIONS)
         filled = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, kernel, iterations=1)
         return filled
 
@@ -609,6 +628,64 @@ class WatermarkRemovalService:
 
         return detections
 
+    def _detect_watermarks_with_yolo_batch(self, images: list[Image.Image]) -> list[list[Detection]]:
+        if not images:
+            return []
+        self._ensure_yolo_model()
+        if self._yolo_model is None:
+            return [[] for _ in images]
+
+        batch_np = [np.array(img) for img in images]
+        predict_kwargs: dict[str, object] = {
+            "verbose": False,
+            "batch": min(self.YOLO_BATCH_SIZE, len(batch_np)),
+        }
+        if self._yolo_device:
+            predict_kwargs["device"] = self._yolo_device
+
+        results = self._yolo_model.predict(batch_np, **predict_kwargs)
+        detections_batch: list[list[Detection]] = []
+
+        names = getattr(self._yolo_model, "names", {})
+        for img, result in zip(images, results):
+            boxes = getattr(result, "boxes", None)
+            if boxes is None or boxes.xyxy is None:
+                detections_batch.append([])
+                continue
+
+            # prefer per-result label mapping when available
+            name_map = getattr(result, "names", None) or names
+            detections: list[Detection] = []
+            for idx in range(len(boxes)):
+                xyxy = boxes.xyxy[idx].tolist()
+                conf_value: Optional[float] = None
+                if boxes.conf is not None:
+                    conf_value = float(boxes.conf[idx])
+                cls_value: Optional[int] = None
+                if boxes.cls is not None:
+                    cls_value = int(boxes.cls[idx])
+
+                label: Optional[str] = None
+                if cls_value is not None:
+                    if isinstance(name_map, dict):
+                        label = name_map.get(cls_value)
+                    elif isinstance(name_map, (list, tuple)) and 0 <= cls_value < len(name_map):
+                        label = name_map[cls_value]
+
+                x1, y1, x2, y2 = map(int, xyxy)
+                x1 = max(0, min(x1, img.width - 1))
+                y1 = max(0, min(y1, img.height - 1))
+                x2 = max(0, min(x2, img.width))
+                y2 = max(0, min(y2, img.height))
+                detections.append(((x1, y1, x2, y2), label, conf_value))
+
+            detections_batch.append(detections)
+
+        if len(detections_batch) < len(images):  # pragma: no cover - defensive
+            detections_batch.extend([[]] * (len(images) - len(detections_batch)))
+
+        return detections_batch
+
     def _build_mask_from_detections(
         self,
         image: Image.Image,
@@ -656,6 +733,37 @@ class WatermarkRemovalService:
             detections = self._detect_watermarks_with_florence(image)
 
         return self._build_mask_from_detections(image, detections, max_bbox_percent)
+
+    def _build_masks_from_detections(
+        self,
+        images: list[Image.Image],
+        detections_batch: list[list[Detection]],
+        max_bbox_percent: float,
+    ) -> list[Image.Image]:
+        masks: list[Image.Image] = []
+        for img, dets in zip(images, detections_batch):
+            masks.append(self._build_mask_from_detections(img, dets, max_bbox_percent))
+        return masks
+
+    def _generate_mask_batch(
+        self,
+        images: list[Image.Image],
+        max_bbox_percent: float,
+        detector: str | None,
+    ) -> list[Image.Image]:
+        if not images:
+            return []
+
+        backend = self._effective_detector(detector)
+        if backend == "yolo":
+            detections_batch = self._detect_watermarks_with_yolo_batch(images)
+            return self._build_masks_from_detections(images, detections_batch, max_bbox_percent)
+
+        # Fallback to sequential processing for Florence or unknown detectors
+        return [
+            self._get_watermark_mask(img, max_bbox_percent, backend)
+            for img in images
+        ]
 
     def _process_image_with_inpainter(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """Remove watermarks from an image using the configured inpainting model.
@@ -812,9 +920,20 @@ class WatermarkRemovalService:
 
         out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
 
-        detection_interval = max(1, int(round(fps)) or 1)
+        use_yolo = detector == "yolo"
+        detection_interval = self.YOLO_BATCH_SIZE if use_yolo else max(1, int(round(fps)) or 1)
+        history_limit = max(
+            1,
+            int(
+                math.ceil(
+                    (fps * self.WATERMARK_ACCUMULATION_SECONDS)
+                    / float(detection_interval)
+                )
+            ),
+        )
         combined_mask_array: np.ndarray | None = None
         mask_image_cached: Image.Image | None = None
+        mask_history: deque[np.ndarray] = deque(maxlen=history_limit)
 
         # Process each frame
         with tqdm.tqdm(total=total_frames, desc="Processing video frames") as pbar:
@@ -830,10 +949,19 @@ class WatermarkRemovalService:
 
                 refresh_mask = mask_image_cached is None or frame_count % detection_interval == 0
                 if refresh_mask:
-                    mask_image_cached = self._get_watermark_mask(pil_image, max_bbox_percent, detector)
-                    combined_mask_array = np.array(mask_image_cached, dtype=np.uint8)
+                    latest_mask_image = self._get_watermark_mask(pil_image, max_bbox_percent, detector)
+                    latest_mask_np = np.array(latest_mask_image, dtype=np.uint8)
+                    mask_history.append(latest_mask_np)
+                    if mask_history:
+                        mask_stack = np.stack(mask_history, axis=0)
+                        combined_mask_array = mask_stack.max(axis=0).astype(np.uint8)
+                    else:  # pragma: no cover - defensive
+                        combined_mask_array = latest_mask_np
+                    mask_image_cached = Image.fromarray(combined_mask_array, mode="L")
                 elif combined_mask_array is None:
-                    combined_mask_array = np.zeros((height, width), dtype=np.uint8)
+                    combined_mask_array = (
+                        mask_history[-1].copy() if mask_history else np.zeros((height, width), dtype=np.uint8)
+                    )
                     mask_image_cached = Image.fromarray(combined_mask_array, mode="L")
 
                 mask_np = combined_mask_array if combined_mask_array is not None else np.zeros(
@@ -1026,9 +1154,54 @@ class WatermarkRemovalService:
             if not decode_proc.stdout or not encode_proc.stdin:
                 raise RuntimeError("Unable to open FFmpeg pipelines for processing.")
 
-            detection_interval = max(1, int(round(fps)) or 1)
-            mask_image_cached: Image.Image | None = None
-            combined_mask_array: np.ndarray | None = None
+            use_yolo = detector == "yolo"
+            batch_size = self.YOLO_BATCH_SIZE if use_yolo else 1
+            history_limit = max(
+                1,
+                int(
+                    math.ceil(
+                        (fps * self.WATERMARK_ACCUMULATION_SECONDS)
+                        / float(max(1, batch_size))
+                    )
+                ),
+            )
+            mask_history: deque[np.ndarray] = deque(maxlen=history_limit)
+            frame_buffer: deque[tuple[np.ndarray, Image.Image]] = deque()
+            pending_masks: deque[np.ndarray] = deque()
+
+            def _union_mask(history: deque[np.ndarray]) -> np.ndarray:
+                if not history:
+                    return np.zeros((height, width), dtype=np.uint8)
+                mask_stack = np.stack(history, axis=0)
+                return mask_stack.max(axis=0).astype(np.uint8)
+
+            def _update_history(raw_mask: np.ndarray) -> np.ndarray:
+                mask_history.append(raw_mask)
+                return _union_mask(mask_history)
+
+            def flush_batches(force: bool = False) -> None:
+                if use_yolo:
+                    while len(frame_buffer) >= batch_size or (force and frame_buffer):
+                        chunk_size = batch_size if len(frame_buffer) >= batch_size else len(frame_buffer)
+                        chunk_images = [frame_buffer[i][1] for i in range(chunk_size)]
+                        mask_images = self._generate_mask_batch(chunk_images, max_bbox_percent, detector)
+                        for mask_img in mask_images:
+                            raw_np = np.array(mask_img, dtype=np.uint8)
+                            combined_np = _update_history(raw_np)
+                            pending_masks.append(combined_np)
+                        if not force:
+                            break
+                        if len(frame_buffer) == 0:
+                            break
+                else:
+                    while frame_buffer and (force or not pending_masks):
+                        image = frame_buffer[0][1]
+                        mask_images = self._generate_mask_batch([image], max_bbox_percent, detector)
+                        raw_np = np.array(mask_images[0], dtype=np.uint8)
+                        combined_np = _update_history(raw_np)
+                        pending_masks.append(combined_np)
+                        if not force:
+                            break
 
             frame_count = 0
             with tqdm.tqdm(total=total_frames or None, desc="Processing video frames") as pbar:
@@ -1039,31 +1212,48 @@ class WatermarkRemovalService:
 
                     frame_np = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3))
                     pil_image = Image.fromarray(frame_np, mode="RGB")
+                    frame_buffer.append((frame_np, pil_image))
 
-                    refresh_mask = mask_image_cached is None or frame_count % detection_interval == 0
-                    if refresh_mask:
-                        mask_image_cached = self._get_watermark_mask(pil_image, max_bbox_percent, detector)
-                        combined_mask_array = np.array(mask_image_cached, dtype=np.uint8)
-                    elif combined_mask_array is None:
-                        combined_mask_array = np.zeros((height, width), dtype=np.uint8)
-                        mask_image_cached = Image.fromarray(combined_mask_array, mode="L")
+                    flush_batches(force=False)
 
-                    mask_np = combined_mask_array if combined_mask_array is not None else np.zeros(
-                        (height, width), dtype=np.uint8
-                    )
-                    mask_image = mask_image_cached if mask_image_cached is not None else Image.fromarray(
-                        mask_np, mode="L"
-                    )
+                    while pending_masks and frame_buffer:
+                        combined_np = pending_masks.popleft()
+                        frame_np_proc, pil_image_proc = frame_buffer.popleft()
+                        mask_image = Image.fromarray(combined_np, mode="L")
+                        mask_np = combined_np
+
+                        if transparent:
+                            result_image = self._make_region_transparent(pil_image_proc, mask_image)
+                            background = Image.new("RGB", result_image.size, (255, 255, 255))
+                            background.paste(result_image, mask=result_image.split()[3])
+                            result_image = background
+                            out_frame = np.array(result_image.convert("RGB"), dtype=np.uint8)
+                        else:
+                            inpaint_result = self._process_image_with_inpainter(
+                                np.array(pil_image_proc), mask_np
+                            )
+                            out_frame = cv2.cvtColor(inpaint_result, cv2.COLOR_BGR2RGB)
+
+                        encode_proc.stdin.write(out_frame.tobytes())
+                        frame_count += 1
+                        pbar.update(1)
+
+                flush_batches(force=True)
+                while pending_masks and frame_buffer:
+                    combined_np = pending_masks.popleft()
+                    _, pil_image_proc = frame_buffer.popleft()
+                    mask_image = Image.fromarray(combined_np, mode="L")
+                    mask_np = combined_np
 
                     if transparent:
-                        result_image = self._make_region_transparent(pil_image, mask_image)
+                        result_image = self._make_region_transparent(pil_image_proc, mask_image)
                         background = Image.new("RGB", result_image.size, (255, 255, 255))
                         background.paste(result_image, mask=result_image.split()[3])
                         result_image = background
                         out_frame = np.array(result_image.convert("RGB"), dtype=np.uint8)
                     else:
                         inpaint_result = self._process_image_with_inpainter(
-                            np.array(pil_image), mask_np
+                            np.array(pil_image_proc), mask_np
                         )
                         out_frame = cv2.cvtColor(inpaint_result, cv2.COLOR_BGR2RGB)
 
