@@ -237,9 +237,9 @@ class WatermarkRemovalService:
                 self.GPU_SEGMENT_FRAMES = 240
                 logger.info(f"Entry GPU config: YOLO batch={self.YOLO_BATCH_SIZE}, Inpaint batch={self.INPAINT_BATCH_SIZE}, Segment={self.GPU_SEGMENT_FRAMES}")
             else:  # Low VRAM: < 8GB
-                self.YOLO_BATCH_SIZE = 12
-                self.INPAINT_BATCH_SIZE = 6
-                self.GPU_SEGMENT_FRAMES = 180
+                self.YOLO_BATCH_SIZE = 8
+                self.INPAINT_BATCH_SIZE = 4
+                self.GPU_SEGMENT_FRAMES = 150
                 logger.info(f"Low VRAM GPU config: YOLO batch={self.YOLO_BATCH_SIZE}, Inpaint batch={self.INPAINT_BATCH_SIZE}, Segment={self.GPU_SEGMENT_FRAMES}")
                 
         except Exception as exc:
@@ -1784,21 +1784,21 @@ class WatermarkRemovalService:
                 if len(raw_masks) != len(frames_rgb):
                     raise RuntimeError("Mismatch between decoded frames and generated masks.")
 
-                persistence_frames = self.WATERMARK_PERSISTENCE_FRAMES
-                accumulation_frames = max(
-                    1,
-                    int(math.ceil(fps * self.WATERMARK_ACCUMULATION_SECONDS)),
-                )
-                union_masks = [mask.copy() for mask in raw_masks]
+                # Propagate masks forward and backward to cover moving watermarks
+                lookahead = SETTINGS.WATERMARK_LOOKAHEAD_FRAMES
+                lookbehind = SETTINGS.WATERMARK_LOOKBEHIND_FRAMES
+                
+                propagated_masks = [mask.copy() for mask in raw_masks]
                 for i, mask in enumerate(raw_masks):
-                    if mask.max() == 0:
-                        continue
-                    start = max(0, i - persistence_frames)
-                    end = min(len(raw_masks), i + accumulation_frames)
-                    for j in range(start, end):
-                        union_masks[j] = np.maximum(union_masks[j], mask)
-
-                raw_masks = union_masks
+                    if mask.max() > 0:
+                        # Propagate forward
+                        for j in range(i + 1, min(i + lookahead + 1, len(raw_masks))):
+                            propagated_masks[j] = np.maximum(propagated_masks[j], mask)
+                        # Propagate backward
+                        for j in range(max(0, i - lookbehind), i):
+                            propagated_masks[j] = np.maximum(propagated_masks[j], mask)
+                
+                raw_masks = propagated_masks
 
             refined_masks = [self._refine_mask(mask) for mask in raw_masks]
 

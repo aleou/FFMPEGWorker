@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     DEFAULT_MAX_BBOX_PERCENT: float = 10.0
     DEFAULT_TRANSPARENT_MODE: bool = False
     DEFAULT_FORCE_FORMAT: str | None = None
+    WATERMARK_LOOKAHEAD_FRAMES: int = 6  # Frames to apply mask forward
+    WATERMARK_LOOKBEHIND_FRAMES: int = 3  # Frames to apply mask backward
 
     # S3 Storage Settings
     S3_ENDPOINT: str | None = None
