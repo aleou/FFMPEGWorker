@@ -103,6 +103,10 @@ class WatermarkRemovalService:
     WATERMARK_POSITION_THRESHOLD = 0.15  # Increased from 0.12 - more lenient position matching
     WATERMARK_MAX_GAP_FRAMES = 5  # Increased from 3 to bridge detection gaps
     INPAINT_BATCH_SIZE = 8  # Increased from 4 - better GPU parallelization
+    
+    # Multi-scale detection settings (can be disabled to save GPU memory)
+    ENABLE_MULTISCALE_DETECTION = True  # Set to False if OOM errors persist
+    MULTISCALE_SCALES = [1.0, 0.8, 1.2]  # Detection scales (100%, 80%, 120%)
 
     def __init__(
         self,
@@ -212,9 +216,10 @@ class WatermarkRemovalService:
             
             # Configure based on VRAM and GPU tier
             if vram_gb >= 24:  # High-end: RTX 4090, RTX 5090, A100, etc.
-                self.YOLO_BATCH_SIZE = 64  # Doubled for better GPU utilization
-                self.INPAINT_BATCH_SIZE = 32  # Doubled for better GPU utilization
-                self.GPU_SEGMENT_FRAMES = 600  # Increased for less I/O overhead
+                # Reduced for multi-scale detection (3x memory usage: 75%, 100%, 125%)
+                self.YOLO_BATCH_SIZE = 16  # Conservative for 3-scale detection
+                self.INPAINT_BATCH_SIZE = 24  # Higher for inpainting (no multi-scale)
+                self.GPU_SEGMENT_FRAMES = 450  # Reduced to fit in memory
                 logger.info(f"High-end GPU config: YOLO batch={self.YOLO_BATCH_SIZE}, Inpaint batch={self.INPAINT_BATCH_SIZE}, Segment={self.GPU_SEGMENT_FRAMES}")
             elif vram_gb >= 16:  # Mid-high: RTX 4080, A40, etc.
                 self.YOLO_BATCH_SIZE = 24
@@ -1051,56 +1056,91 @@ class WatermarkRemovalService:
         device = self._yolo_device or ("cuda" if torch.cuda.is_available() else "cpu")
         boxes_per_frame: list[list[tuple[int, int, int, int]]] = []
         
-        # Multi-scale detection: run at 100%, 75%, and 125% scale for better coverage
-        scales = [1.0, 0.75, 1.25]
+        # Multi-scale detection: run at multiple scales for better coverage
+        # Can be disabled via ENABLE_MULTISCALE_DETECTION if memory is limited
+        if self.ENABLE_MULTISCALE_DETECTION:
+            scales = self.MULTISCALE_SCALES
+            logger.info(f"Using multi-scale detection with scales: {scales}")
+        else:
+            scales = [1.0]  # Single-scale detection only
+            logger.info("Using single-scale detection (multi-scale disabled to save memory)")
         
-        for segment in segments:
-            if segment.device.type != "cuda":
-                segment = segment.to(device=device)
-            
-            all_boxes_frame: list[list[tuple[int, int, int, int]]] = []
-            
-            for scale in scales:
-                if scale != 1.0:
-                    # Resize segment for multi-scale detection
-                    b, c, h, w = segment.shape
-                    new_h, new_w = int(h * scale), int(w * scale)
-                    scaled_segment = torch.nn.functional.interpolate(
-                        segment, size=(new_h, new_w), mode='bilinear', align_corners=False
-                    )
-                else:
-                    scaled_segment = segment
+        try:
+            for segment in segments:
+                if segment.device.type != "cuda":
+                    segment = segment.to(device=device)
                 
-                inputs = scaled_segment.float()
-                predict_kwargs: dict[str, Any] = {
-                    "verbose": False,
-                    "device": device,
-                    "batch": min(self.YOLO_BATCH_SIZE, inputs.shape[0]),
-                    "conf": 0.12,  # Even lower confidence for multi-scale (was 0.15)
-                    "iou": 0.25,   # Lower IOU for better overlapping detection
-                    "agnostic_nms": True,
-                    "max_det": 100,  # Allow more detections per image
-                }
-                if inputs.dtype == torch.float16:
-                    predict_kwargs["half"] = True
+                all_boxes_frame: list[list[tuple[int, int, int, int]]] = []
                 
-                results = self._yolo_model.predict(inputs, **predict_kwargs)
+                # Process each scale separately to minimize memory usage
+                for scale in scales:
+                    # Clear CUDA cache before each scale to prevent OOM
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    if scale != 1.0:
+                        # Resize segment for multi-scale detection
+                        b, c, h, w = segment.shape
+                        new_h, new_w = int(h * scale), int(w * scale)
+                        scaled_segment = torch.nn.functional.interpolate(
+                            segment, size=(new_h, new_w), mode='bilinear', align_corners=False
+                        )
+                    else:
+                        scaled_segment = segment
+                    
+                    inputs = scaled_segment.float()
+                    
+                    # Reduce batch size for multi-scale to prevent OOM
+                    if len(scales) > 1:
+                        effective_batch_size = max(4, self.YOLO_BATCH_SIZE // 4)
+                    else:
+                        effective_batch_size = self.YOLO_BATCH_SIZE
+                    
+                    predict_kwargs: dict[str, Any] = {
+                        "verbose": False,
+                        "device": device,
+                        "batch": min(effective_batch_size, inputs.shape[0]),
+                        "conf": 0.15,  # Slightly higher confidence to reduce false positives
+                        "iou": 0.3,    # Higher IOU for better filtering
+                        "agnostic_nms": True,
+                        "max_det": 50,  # Reduced from 100 to save memory
+                    }
+                    if inputs.dtype == torch.float16:
+                        predict_kwargs["half"] = True
+                    
+                    results = self._yolo_model.predict(inputs, **predict_kwargs)
+                    
+                    # Scale boxes back to original size
+                    scale_factor = 1.0 / scale
+                    frame_boxes: list[tuple[int, int, int, int]] = []
+                    for result in results:
+                        boxes = getattr(result, "boxes", None)
+                        if boxes is not None and boxes.xyxy is not None:
+                            xyxy = boxes.xyxy.detach().to("cpu").numpy()
+                            for bb in xyxy:
+                                x1, y1, x2, y2 = map(int, (bb[:4] * scale_factor))
+                                frame_boxes.append((x1, y1, x2, y2))
+                    all_boxes_frame.append(frame_boxes)
                 
-                # Scale boxes back to original size
-                scale_factor = 1.0 / scale
-                frame_boxes: list[tuple[int, int, int, int]] = []
-                for result in results:
-                    boxes = getattr(result, "boxes", None)
-                    if boxes is not None and boxes.xyxy is not None:
-                        xyxy = boxes.xyxy.detach().to("cpu").numpy()
-                        for bb in xyxy:
-                            x1, y1, x2, y2 = map(int, (bb[:4] * scale_factor))
-                            frame_boxes.append((x1, y1, x2, y2))
-                all_boxes_frame.append(frame_boxes)
-            
-            # Merge boxes from all scales (remove duplicates with NMS)
-            merged_boxes = self._merge_multiscale_boxes(all_boxes_frame)
-            boxes_per_frame.append(merged_boxes)
+                # Merge boxes from all scales (remove duplicates with NMS)
+                merged_boxes = self._merge_multiscale_boxes(all_boxes_frame)
+                boxes_per_frame.append(merged_boxes)
+        
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.warning(
+                    "CUDA out of memory during multi-scale detection. "
+                    "Disabling multi-scale and retrying with single-scale detection."
+                )
+                # Disable multi-scale for subsequent runs
+                self.ENABLE_MULTISCALE_DETECTION = False
+                # Clear cache and retry with single scale
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # Recursive call with single-scale
+                return self._detect_boxes_for_segments(segments, detector)
+            else:
+                raise
 
         return boxes_per_frame
     
