@@ -212,9 +212,9 @@ class WatermarkRemovalService:
             
             # Configure based on VRAM and GPU tier
             if vram_gb >= 24:  # High-end: RTX 4090, RTX 5090, A100, etc.
-                self.YOLO_BATCH_SIZE = 32
-                self.INPAINT_BATCH_SIZE = 16
-                self.GPU_SEGMENT_FRAMES = 450
+                self.YOLO_BATCH_SIZE = 64  # Doubled for better GPU utilization
+                self.INPAINT_BATCH_SIZE = 32  # Doubled for better GPU utilization
+                self.GPU_SEGMENT_FRAMES = 600  # Increased for less I/O overhead
                 logger.info(f"High-end GPU config: YOLO batch={self.YOLO_BATCH_SIZE}, Inpaint batch={self.INPAINT_BATCH_SIZE}, Segment={self.GPU_SEGMENT_FRAMES}")
             elif vram_gb >= 16:  # Mid-high: RTX 4080, A40, etc.
                 self.YOLO_BATCH_SIZE = 24
@@ -576,15 +576,21 @@ class WatermarkRemovalService:
             "-c:v",
             "h264_nvenc",
             "-preset",
-            "p7",  # Fastest preset for better performance
+            "p4",  # Slower preset for MUCH better quality (p4 = balanced quality/speed)
             "-tune",
             "hq",  # High quality
             "-rc",
             "vbr",  # Variable bitrate for better quality
             "-cq",
-            "19",  # Quality level (lower = better, 19 is visually lossless)
+            "16",  # Quality level (lower = better, 16 is near-lossless with grain preservation)
             "-b:v",
             "0",  # Let NVENC decide bitrate
+            "-multipass",
+            "fullres",  # 2-pass encoding for better quality
+            "-spatial-aq",
+            "1",  # Spatial AQ for better quality in complex areas
+            "-temporal-aq",
+            "1",  # Temporal AQ for better motion quality
             "-pix_fmt",
             "yuv420p",
             "-movflags",
@@ -647,9 +653,11 @@ class WatermarkRemovalService:
             "-c:v",
             "libx264",
             "-preset",
-            "fast",
+            "slow",  # Slower but much better quality
             "-crf",
-            "18",
+            "16",  # Lower CRF = better quality (18→16 for near-lossless)
+            "-tune",
+            "film",  # Preserve grain and fine details
             "-pix_fmt",
             "yuv420p",
             "-movflags",
@@ -1042,30 +1050,105 @@ class WatermarkRemovalService:
 
         device = self._yolo_device or ("cuda" if torch.cuda.is_available() else "cpu")
         boxes_per_frame: list[list[tuple[int, int, int, int]]] = []
+        
+        # Multi-scale detection: run at 100%, 75%, and 125% scale for better coverage
+        scales = [1.0, 0.75, 1.25]
+        
         for segment in segments:
             if segment.device.type != "cuda":
                 segment = segment.to(device=device)
-            inputs = segment.float()
-            predict_kwargs: dict[str, Any] = {
-                "verbose": False,
-                "device": device,
-                "batch": min(self.YOLO_BATCH_SIZE, inputs.shape[0]),
-            }
-            if inputs.dtype == torch.float16:
-                predict_kwargs["half"] = True
-            results = self._yolo_model.predict(inputs, **predict_kwargs)
-            names = getattr(self._yolo_model, "names", {})
-            for result in results:
-                boxes_frame: list[tuple[int, int, int, int]] = []
-                boxes = getattr(result, "boxes", None)
-                if boxes is not None and boxes.xyxy is not None:
-                    xyxy = boxes.xyxy.detach().to("cpu").numpy()
-                    for bb in xyxy:
-                        x1, y1, x2, y2 = map(int, bb[:4])
-                        boxes_frame.append((x1, y1, x2, y2))
-                boxes_per_frame.append(boxes_frame)
+            
+            all_boxes_frame: list[list[tuple[int, int, int, int]]] = []
+            
+            for scale in scales:
+                if scale != 1.0:
+                    # Resize segment for multi-scale detection
+                    b, c, h, w = segment.shape
+                    new_h, new_w = int(h * scale), int(w * scale)
+                    scaled_segment = torch.nn.functional.interpolate(
+                        segment, size=(new_h, new_w), mode='bilinear', align_corners=False
+                    )
+                else:
+                    scaled_segment = segment
+                
+                inputs = scaled_segment.float()
+                predict_kwargs: dict[str, Any] = {
+                    "verbose": False,
+                    "device": device,
+                    "batch": min(self.YOLO_BATCH_SIZE, inputs.shape[0]),
+                    "conf": 0.12,  # Even lower confidence for multi-scale (was 0.15)
+                    "iou": 0.25,   # Lower IOU for better overlapping detection
+                    "agnostic_nms": True,
+                    "max_det": 100,  # Allow more detections per image
+                }
+                if inputs.dtype == torch.float16:
+                    predict_kwargs["half"] = True
+                
+                results = self._yolo_model.predict(inputs, **predict_kwargs)
+                
+                # Scale boxes back to original size
+                scale_factor = 1.0 / scale
+                frame_boxes: list[tuple[int, int, int, int]] = []
+                for result in results:
+                    boxes = getattr(result, "boxes", None)
+                    if boxes is not None and boxes.xyxy is not None:
+                        xyxy = boxes.xyxy.detach().to("cpu").numpy()
+                        for bb in xyxy:
+                            x1, y1, x2, y2 = map(int, (bb[:4] * scale_factor))
+                            frame_boxes.append((x1, y1, x2, y2))
+                all_boxes_frame.append(frame_boxes)
+            
+            # Merge boxes from all scales (remove duplicates with NMS)
+            merged_boxes = self._merge_multiscale_boxes(all_boxes_frame)
+            boxes_per_frame.append(merged_boxes)
 
         return boxes_per_frame
+    
+    def _merge_multiscale_boxes(
+        self, 
+        boxes_list: list[list[tuple[int, int, int, int]]]
+    ) -> list[tuple[int, int, int, int]]:
+        """Merge boxes from multiple scales using IoU-based NMS."""
+        if not boxes_list:
+            return []
+        
+        # Flatten all boxes
+        all_boxes = []
+        for boxes in boxes_list:
+            all_boxes.extend(boxes)
+        
+        if not all_boxes:
+            return []
+        
+        # Simple NMS: remove boxes with high IoU overlap
+        def box_iou(box1: tuple[int, int, int, int], box2: tuple[int, int, int, int]) -> float:
+            x1 = max(box1[0], box2[0])
+            y1 = max(box1[1], box2[1])
+            x2 = min(box1[2], box2[2])
+            y2 = min(box1[3], box2[3])
+            
+            if x2 < x1 or y2 < y1:
+                return 0.0
+            
+            intersection = (x2 - x1) * (y2 - y1)
+            area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+            area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+            union = area1 + area2 - intersection
+            
+            return intersection / union if union > 0 else 0.0
+        
+        # Keep unique boxes (IoU < 0.5)
+        unique_boxes = []
+        for box in all_boxes:
+            is_duplicate = False
+            for existing in unique_boxes:
+                if box_iou(box, existing) > 0.5:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                unique_boxes.append(box)
+        
+        return unique_boxes
 
     @staticmethod
     def _box_center(box: tuple[int, int, int, int]) -> tuple[float, float]:
@@ -1723,7 +1806,10 @@ class WatermarkRemovalService:
                 detector=detector,
             )
         except Exception as exc:
-            logger.error("GPU video pipeline failed with error: %s (type: %s). Falling back to CPU implementation.", str(exc), type(exc).__name__, exc_info=True)
+            logger.error(
+                f"GPU video pipeline failed with error: {str(exc)} (type: {type(exc).__name__}). Falling back to CPU implementation.",
+                exc_info=True
+            )
             return self._process_video_cpu(
                 input_path=input_path,
                 output_path=output_path,
