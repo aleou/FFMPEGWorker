@@ -1,70 +1,112 @@
 #!/bin/bash
-# Script to fully rebuild Docker image with cache clearing
-# Usage: Run this on your Ubuntu VM after pulling latest code
+# Rebuild and push Docker images with selectable cache strategy.
+# Usage:
+#   ./rebuild_and_push.sh            # soft rebuild (default)
+#   ./rebuild_and_push.sh soft       # same as default
+#   ./rebuild_and_push.sh full       # clear caches and rebuild from scratch
+#   ./rebuild_and_push.sh --help     # show help
 
-set -e  # Exit on any error
+set -euo pipefail
 
-echo "================================================"
-echo "🚀 FFMPEGWorker - Full Rebuild & Push Script"
-echo "================================================"
-echo ""
+SOFT_ICON="[soft]"
+FULL_ICON="[full]"
 
-# Colors for output
+# ANSI colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Get version from docker-bake.hcl
+echo "================================================"
+echo "FFMPEGWorker - Rebuild & Push Script"
+echo "================================================"
+echo ""
+
+show_help() {
+  cat <<'EOF'
+Usage: ./rebuild_and_push.sh [soft|full]
+
+  soft (default)  Rebuild using existing Docker cache (faster)
+  full            Stop containers, purge cache, rebuild from scratch
+  --help          Display this help message
+EOF
+}
+
+MODE="${1:-soft}"
+case "$MODE" in
+  soft|--soft)
+    echo -e "${YELLOW}${SOFT_ICON} Soft rebuild selected (cache preserved).${NC}"
+    CLEAN_CACHE=false
+    NO_CACHE_FLAG=""
+    ;;
+  full|--full)
+    echo -e "${YELLOW}${FULL_ICON} Full rebuild selected (cache will be cleared).${NC}"
+    CLEAN_CACHE=true
+    NO_CACHE_FLAG="--no-cache"
+    ;;
+  -h|--help|help)
+    show_help
+    exit 0
+    ;;
+  *)
+    echo -e "${RED}Unknown option '$MODE'. Use soft, full or --help.${NC}"
+    exit 1
+    ;;
+esac
+echo ""
+
+# Extract release version from docker-bake.hcl
 VERSION=$(grep 'default = "' docker-bake.hcl | grep RELEASE_VERSION -A 1 | tail -1 | sed 's/.*"\(.*\)".*/\1/')
-echo -e "${GREEN}📦 Version: ${VERSION}${NC}"
+echo -e "${GREEN}Version detected: ${VERSION}${NC}"
 echo ""
 
-# Step 1: Stop all running containers
-echo -e "${YELLOW}⏹️  Stopping all running containers...${NC}"
-docker stop $(docker ps -aq) 2>/dev/null || echo "No containers to stop"
-echo ""
+if [ "$CLEAN_CACHE" = true ]; then
+  echo -e "${YELLOW}${FULL_ICON} Stopping running containers...${NC}"
+  docker stop $(docker ps -aq) 2>/dev/null || echo "No containers to stop."
+  echo ""
 
-# Step 2: Remove old images
-echo -e "${YELLOW}🗑️  Removing old aleou/ffmpeg-worker images...${NC}"
-docker rmi -f $(docker images 'aleou/ffmpeg-worker' -q) 2>/dev/null || echo "No images to remove"
-echo ""
+  echo -e "${YELLOW}${FULL_ICON} Removing existing aleou/ffmpeg-worker images...${NC}"
+  docker rmi -f $(docker images 'aleou/ffmpeg-worker' -q) 2>/dev/null || echo "No images to remove."
+  echo ""
 
-# Step 3: Clear buildx cache
-echo -e "${YELLOW}🧹 Clearing Docker buildx cache...${NC}"
-docker buildx prune -a -f
-echo ""
+  echo -e "${YELLOW}${FULL_ICON} Pruning Docker buildx cache...${NC}"
+  docker buildx prune -a -f
+  echo ""
 
-# Step 4: Clear system cache
-echo -e "${YELLOW}🧹 Clearing Docker system cache...${NC}"
-docker system prune -a -f
-echo ""
+  echo -e "${YELLOW}${FULL_ICON} Pruning Docker system cache...${NC}"
+  docker system prune -a -f
+  echo ""
+else
+  echo -e "${YELLOW}${SOFT_ICON} Skipping cache and container cleanup. Use 'full' to force a clean rebuild.${NC}"
+  echo ""
+fi
 
-# Step 5: Show disk usage
-echo -e "${YELLOW}💾 Current Docker disk usage:${NC}"
+echo -e "${YELLOW}Current Docker disk usage:${NC}"
 docker system df
 echo ""
 
-# Step 6: Rebuild with no cache
-echo -e "${GREEN}🔨 Building fresh images with --no-cache...${NC}"
-echo "This will take 10-15 minutes (downloading models + compiling)..."
+if [ "$CLEAN_CACHE" = true ]; then
+  echo -e "${GREEN}${FULL_ICON} Building images with --no-cache (this may take a while).${NC}"
+else
+  echo -e "${GREEN}${SOFT_ICON} Building images using existing cache.${NC}"
+fi
 echo ""
-docker buildx bake --no-cache --push
 
-# Step 7: Verify push
+docker buildx bake $NO_CACHE_FLAG --push
+
 echo ""
-echo -e "${GREEN}✅ Build complete!${NC}"
+echo -e "${GREEN}Build complete!${NC}"
 echo ""
-echo -e "${YELLOW}📋 Verify on Docker Hub:${NC}"
-echo "   https://hub.docker.com/r/aleou/ffmpeg-worker/tags"
+echo -e "${YELLOW}Verify on Docker Hub:${NC}"
+echo "  https://hub.docker.com/r/aleou/ffmpeg-worker/tags"
 echo ""
-echo -e "${YELLOW}🔍 Check image digest:${NC}"
+echo -e "${YELLOW}Check image digests:${NC}"
 docker images aleou/ffmpeg-worker --digests
 echo ""
-echo -e "${GREEN}🎉 Done! New image pushed with version ${VERSION}${NC}"
+echo -e "${GREEN}Done! New image pushed with version ${VERSION}.${NC}"
 echo ""
-echo -e "${YELLOW}⚠️  Next steps:${NC}"
+echo -e "${YELLOW}Next steps:${NC}"
 echo "1. Update RunPod template to use: aleou/ffmpeg-worker:${VERSION}-serverless"
-echo "2. Or use digest for guaranteed exact image: aleou/ffmpeg-worker@sha256:xxxxx"
-echo "3. Run test job and check logs for real error messages (no more '%s')"
+echo "2. Or reference the image digest for a fixed deployment"
+echo "3. Run a test job and confirm logs look healthy"
 echo ""
