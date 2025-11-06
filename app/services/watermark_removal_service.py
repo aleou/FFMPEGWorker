@@ -99,6 +99,7 @@ class WatermarkRemovalService:
     YOLO_BATCH_SIZE = 16  # Increased from 4 - better GPU utilization
     GPU_SEGMENT_FRAMES = 300  # Increased from 180 - process larger chunks
     WATERMARK_LOOKBACK_FRAMES = 9  # Increased from 6 for better temporal tracking
+    WATERMARK_LOOKBACK_SECONDS = 1.0  # Additional lookback window (~30 frames @30fps)
     WATERMARK_LOOKAHEAD_SECONDS = 1.5  # Increased from 1.0
     WATERMARK_POSITION_THRESHOLD = 0.15  # Increased from 0.12 - more lenient position matching
     WATERMARK_MAX_GAP_FRAMES = 5  # Increased from 3 to bridge detection gaps
@@ -1227,7 +1228,9 @@ class WatermarkRemovalService:
     ) -> list[list[tuple[int, int, int, int]]]:
         num_frames = len(boxes_per_frame)
         propagated: list[list[tuple[int, int, int, int]]] = [list(boxes) for boxes in boxes_per_frame]
-        lookback = self.WATERMARK_LOOKBACK_FRAMES
+        lookback_seconds = max(0.0, self.WATERMARK_LOOKBACK_SECONDS)
+        lookback_dynamic = int(round(fps * lookback_seconds)) if lookback_seconds > 0 else 0
+        lookback = max(self.WATERMARK_LOOKBACK_FRAMES, lookback_dynamic)
         lookahead = max(1, int(round(fps * self.WATERMARK_LOOKAHEAD_SECONDS)))
         max_gap = self.WATERMARK_MAX_GAP_FRAMES
         diag = math.hypot(width, height)
@@ -1789,10 +1792,16 @@ class WatermarkRemovalService:
                 if len(raw_masks) != len(frames_rgb):
                     raise RuntimeError("Mismatch between decoded frames and generated masks.")
 
-                # Propagate masks forward and backward to cover moving watermarks
-                lookahead = SETTINGS.WATERMARK_LOOKAHEAD_FRAMES
-                lookbehind = SETTINGS.WATERMARK_LOOKBEHIND_FRAMES
-                
+                # Propagate masks forward/backward to cover moving watermarks when detector yields sparse results.
+                lookahead = max(
+                    self.WATERMARK_LOOKBACK_FRAMES,
+                    int(round(fps * self.WATERMARK_LOOKAHEAD_SECONDS)),
+                )
+                lookbehind = max(
+                    self.WATERMARK_LOOKBACK_FRAMES,
+                    int(round(fps * self.WATERMARK_LOOKBACK_SECONDS)),
+                )
+
                 propagated_masks = [mask.copy() for mask in raw_masks]
                 for i, mask in enumerate(raw_masks):
                     if mask.max() > 0:
