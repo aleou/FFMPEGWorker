@@ -9,6 +9,7 @@ from urllib.parse import urlparse, unquote
 from app.schemas.job import JobRead, JobStatus, JobUpdate
 from app.services.job_service import JobService
 from app.services.watermark_removal_service import WatermarkRemovalService
+from app.services.video_upscaler_service import VideoUpscalerService
 from app.utils.ffmpeg import build_ffmpeg_command, run_ffmpeg_command
 from app.utils.s3_uploader import S3Uploader
 
@@ -22,10 +23,12 @@ class VideoProcessingWorker:
         self,
         job_service: JobService,
         watermark_service: WatermarkRemovalService | None = None,
+        upscaler_service: VideoUpscalerService | None = None,
         storage_uploader: S3Uploader | None = None,
     ) -> None:
         self._job_service = job_service
         self._watermark_service = watermark_service
+        self._upscaler_service = upscaler_service
         self._storage_uploader = storage_uploader
 
     async def process_job(self, job: JobRead) -> None:
@@ -41,6 +44,8 @@ class VideoProcessingWorker:
         try:
             if job.job_type == "watermark_removal":
                 await self._process_watermark_removal_job(job)
+            elif job.job_type == "upscale":
+                await self._process_upscale_job(job)
             else:
                 # Default video processing
                 await self._process_video_job(job)
@@ -110,6 +115,52 @@ class VideoProcessingWorker:
                     key_prefix=f"jobs/{job.id}",
                 )
                 logger.info("Uploaded result for job %s to %s", job.id, result_url)
+                self._job_service.update_job(job.id, JobUpdate(result_url=result_url))
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed to upload result for job %s: %s", job.id, exc)
+
+    async def _process_upscale_job(self, job: JobRead) -> None:
+        """Process a video upscaling job."""
+        if not self._upscaler_service:
+            raise ValueError("Video upscaler service not available")
+
+        if not job.upscale_config:
+            raise ValueError("Upscale configuration missing")
+
+        input_path = self._resolve_path(job.source_uri)
+        output_path = self._resolve_path(job.target_uri)
+
+        # Ensure output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        config = job.upscale_config
+
+        logger.info("Starting video upscaling with config: %s", config)
+
+        # Update upscaler settings
+        self._upscaler_service.model_name = config.model
+        self._upscaler_service.half_precision = config.half_precision
+        if config.tile_size > 0:
+            self._upscaler_service.tile_size = config.tile_size
+
+        # Process the video
+        result_path = self._upscaler_service.upscale_video_gpu_optimized(
+            input_path=input_path,
+            output_path=output_path,
+            batch_size=config.batch_size,
+            fps=config.target_fps,
+            audio=config.preserve_audio,
+        )
+
+        logger.info("Video upscaling completed: %s -> %s", input_path, result_path)
+
+        if self._storage_uploader:
+            try:
+                result_url = self._storage_uploader.store_file_and_get_url(
+                    Path(result_path),
+                    key_prefix=f"jobs/{job.id}",
+                )
+                logger.info("Uploaded upscaled video for job %s to %s", job.id, result_url)
                 self._job_service.update_job(job.id, JobUpdate(result_url=result_url))
             except Exception as exc:  # noqa: BLE001
                 logger.error("Failed to upload result for job %s: %s", job.id, exc)

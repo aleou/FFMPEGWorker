@@ -35,6 +35,21 @@ class WatermarkRemovalConfig(BaseModel):
         return self
 
 
+class VideoUpscaleConfig(BaseModel):
+    """Configuration for video upscaling jobs."""
+
+    model: str = Field(
+        default="RealESRGAN_x4plus",
+        description="Upscaling model: RealESRGAN_x4plus, RealESRGAN_x4plus_anime_6B, RealESRNet_x4plus, realesr-animevideov3"
+    )
+    scale: int = Field(default=4, ge=2, le=4, description="Upscaling factor (2x or 4x)")
+    tile_size: int = Field(default=0, ge=0, description="Tile size for processing (0=auto, 256/512 for low VRAM)")
+    half_precision: bool = Field(default=True, description="Use FP16 for faster GPU processing")
+    preserve_audio: bool = Field(default=True, description="Preserve original audio track")
+    target_fps: float | None = Field(default=None, description="Target FPS (None = keep original)")
+    batch_size: int = Field(default=4, ge=1, le=16, description="Batch size for GPU processing")
+
+
 class JobStatus(str, Enum):
     """Lifecycle state of a processing job."""
 
@@ -50,8 +65,9 @@ class JobBase(BaseModel):
     source_uri: AnyUrl | Path = Field(..., description="Location of the source video to ingest (URL or local path).")
     target_uri: AnyUrl | Path = Field(..., description="Destination where the processed video will be saved (URL or local path).")
     metadata: Dict[str, Any] | None = Field(default=None, description="Optional job-specific metadata payload.")
-    job_type: str = Field(default="video_processing", description="Type of job (video_processing, watermark_removal, etc.)")
+    job_type: str = Field(default="video_processing", description="Type of job (video_processing, watermark_removal, upscale, etc.)")
     watermark_removal_config: WatermarkRemovalConfig | None = Field(default=None, description="Configuration for watermark removal jobs.")
+    upscale_config: VideoUpscaleConfig | None = Field(default=None, description="Configuration for video upscaling jobs.")
 
 
 class JobCreate(JobBase):
