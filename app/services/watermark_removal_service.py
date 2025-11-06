@@ -1244,28 +1244,33 @@ class WatermarkRemovalService:
                     existing = boxes_per_frame[j]
                     if existing:
                         min_dist = min(self._box_center_distance(box, prev_box) for prev_box in existing)
-                        if min_dist > threshold:
-                            break
-                        gap = 0
+                        if min_dist <= threshold:
+                            gap = 0
+                        # Propagate even if other boxes are far away so multiple tracks coexist.
+                        if box not in propagated[j]:
+                            propagated[j].append(box)
                     else:
                         gap += 1
                         if gap > max_gap:
                             break
-                    propagated[j].append(box)
+                        if box not in propagated[j]:
+                            propagated[j].append(box)
 
                 gap = 0
                 for j in range(idx + 1, min(num_frames, idx + lookahead + 1)):
                     existing = boxes_per_frame[j]
                     if existing:
                         min_dist = min(self._box_center_distance(box, next_box) for next_box in existing)
-                        if min_dist > threshold:
-                            break
-                        gap = 0
+                        if min_dist <= threshold:
+                            gap = 0
+                        if box not in propagated[j]:
+                            propagated[j].append(box)
                     else:
                         gap += 1
                         if gap > max_gap:
                             break
-                    propagated[j].append(box)
+                        if box not in propagated[j]:
+                            propagated[j].append(box)
 
         return propagated
 
