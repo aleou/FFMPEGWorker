@@ -56,7 +56,11 @@ esac
 echo ""
 
 # Extract release version from docker-bake.hcl
-VERSION=$(grep 'default = "' docker-bake.hcl | grep RELEASE_VERSION -A 1 | tail -1 | sed 's/.*"\(.*\)".*/\1/')
+VERSION=$(grep -A1 'variable "RELEASE_VERSION"' docker-bake.hcl | grep 'default' | sed 's/.*"\(.*\)".*/\1/' || true)
+if [ -z "${VERSION}" ]; then
+  echo -e "${YELLOW}Warning: unable to determine RELEASE_VERSION from docker-bake.hcl. Using 'unknown'.${NC}"
+  VERSION="unknown"
+fi
 echo -e "${GREEN}Version detected: ${VERSION}${NC}"
 echo ""
 
