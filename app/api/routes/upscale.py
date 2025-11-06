@@ -20,6 +20,8 @@ router = APIRouter(prefix="/upscale", tags=["upscale"])
 @router.post("/", response_model=JobRead, status_code=201)
 async def create_upscale_job(
     file: Annotated[UploadFile, File(description="Video file to upscale")],
+    job_service: JobServiceDep,
+    settings: SettingsDep,
     model: Annotated[str, Form()] = "RealESRGAN_x4plus",
     scale: Annotated[int, Form(ge=1, le=4)] = 4,
     tile_size: Annotated[int, Form(ge=0)] = 0,
@@ -27,8 +29,6 @@ async def create_upscale_job(
     preserve_audio: Annotated[bool, Form()] = True,
     target_fps: Annotated[float | None, Form()] = None,
     batch_size: Annotated[int, Form(ge=1, le=16)] = 4,
-    job_service: JobServiceDep,
-    settings: SettingsDep,
 ) -> JobRead:
     """Create a new video upscaling job from an uploaded file."""
 
@@ -82,6 +82,8 @@ async def create_upscale_job(
 @router.post("/url", response_model=JobRead, status_code=201)
 async def create_upscale_job_from_url(
     source_url: str,
+    job_service: JobServiceDep,
+    settings: SettingsDep,
     model: str = "RealESRGAN_x4plus",
     scale: int = 4,
     tile_size: int = 0,
@@ -89,8 +91,6 @@ async def create_upscale_job_from_url(
     preserve_audio: bool = True,
     target_fps: float | None = None,
     batch_size: int = 4,
-    job_service: JobServiceDep,
-    settings: SettingsDep,
 ) -> JobRead:
     """Create a video upscaling job from a remote URL."""
 
